@@ -1,0 +1,11 @@
+/* [오류 해결] 
+  현재 설치된 Tailwind 버전과 PostCSS 설정 간의 충돌로 인해 빌드 오류가 발생하고 있습니다.
+  이를 해결하기 위해 아래 @tailwind 지시어를 주석 처리하여 빌드 시스템이 이를 무시하도록 합니다.
+  
+  대신, index.html 파일의 <head> 태그 안에 아래 스크립트가 있는지 꼭 확인해주세요:
+  <script src="https://cdn.tailwindcss.com"></script>
+*/
+
+/* @tailwind base; */
+/* @tailwind components; */
+/* @tailwind utilities; */

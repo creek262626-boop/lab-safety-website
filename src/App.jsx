@@ -1288,6 +1288,9 @@ export default function App() {
         return { ...row, licensed, licensedMultiple, current, currentMultiple };
     });
 
+    // ✅ 합계 보유량 (단위 혼합 가능하므로 수치 합산)
+    const totalCurrentAmount = tableData.reduce((sum, row) => sum + (row.current || 0), 0);
+
     return (
       <div className="space-y-6">
         <h2 className="text-2xl font-bold text-slate-800">통합 대시보드</h2>
@@ -1370,7 +1373,7 @@ export default function App() {
                             <tr>
                                 <td colSpan="4" className="p-3 border-r text-center">합계</td>
                                 <td className="p-3 border-r text-right">{totalLicensedMultiple.toFixed(2)}</td>
-                                <td className="p-3 border-r text-right">-</td>
+                                <td className="p-3 border-r text-right font-bold text-blue-600">{totalCurrentAmount.toLocaleString()}</td>
                                 <td className={`p-3 text-right ${totalCurrentMultiple >= 1 ? 'text-red-600' : 'text-green-600'}`}>
                                     {totalCurrentMultiple.toFixed(4)}
                                 </td>
@@ -1394,8 +1397,8 @@ export default function App() {
         if (!acc[key]) acc[key] = { ...item, amount: Number(item.amount) };
         else acc[key].amount += Number(item.amount);
         return acc;
-    }, {})).sort((a,b) => (a.shelf||'').localeCompare(b.shelf||'','ko'));
-    const labGrouped = [...new Set(filteredInventory.map(i => i.labName))].sort((a,b) => (a||'').localeCompare(b||'','ko'));
+    }, {})).sort((a,b) => (a.shelf||'미지정').localeCompare(b.shelf||'미지정','ko',{numeric:true}));
+    const labGrouped = [...new Set(filteredInventory.map(i => i.labName).filter(Boolean))].sort((a,b) => a.localeCompare(b,'ko'));
 
     const openShelfDetail = (item) => {
         const sameItems = inventory.filter(i => i.chemicalName === item.chemicalName && i.storage === item.storage && i.shelf === item.shelf);
@@ -1444,7 +1447,7 @@ export default function App() {
                 <div className="overflow-y-auto flex-1 p-2">
                     <ul className="divide-y divide-slate-100">
                         {labGrouped.map((lab, idx) => (
-                            <li key={idx} className="p-4 hover:bg-slate-50 flex justify-between items-center cursor-pointer" onClick={() => setSelectedLabDetail({ labName: lab, items: inventory.filter(i => i.labName === lab) })}>
+                            <li key={idx} className="p-4 hover:bg-slate-50 flex justify-between items-center cursor-pointer" onClick={() => setSelectedLabDetail({ labName: lab, items: inventory.filter(i => i.labName === lab && Number(i.amount) > 0).sort((a,b) => (a.shelf||'미지정').localeCompare(b.shelf||'미지정','ko',{numeric:true})) })}>
                                 <span className="font-bold text-slate-700 truncate mr-2">{lab}</span>
                                 <button className="text-xs bg-blue-100 text-blue-700 px-3 py-1 rounded-full font-bold flex-shrink-0">보유 목록</button>
                             </li>
@@ -1525,11 +1528,11 @@ export default function App() {
                 </div>
                 
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                    {Object.keys(stats).map(storageName => (
+                    {Object.keys(stats).sort((a,b) => a.localeCompare(b,'ko')).map(storageName => (
                         <div key={storageName} className="bg-white rounded-xl shadow border overflow-hidden">
                             <h3 className="bg-slate-800 text-white p-4 font-bold">{storageName}</h3>
                             <div className="p-2">
-                                {Object.keys(stats[storageName]).map(type => {
+                                {Object.keys(stats[storageName]).sort((a,b) => a.localeCompare(b,'ko')).map(type => {
                                     const id = `${storageName}_${type}`;
                                     const isExpanded = expandedStats[id];
                                     return (

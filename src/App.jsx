@@ -1024,7 +1024,7 @@ export default function App() {
               <div>
                 {n.important && <span className="text-[10px] font-bold bg-red-500 text-white px-1.5 py-0.5 rounded-full mr-1">중요</span>}
                 <span className="font-bold text-slate-800">{n.title}</span>
-                <p className="text-slate-600 mt-0.5 text-xs">{n.content}</p>
+                <p className="text-slate-600 mt-0.5 text-xs whitespace-pre-wrap">{n.content}</p>
                 <span className="text-xs text-slate-400">{n.date}</span>
               </div>
             </div>
@@ -1447,7 +1447,7 @@ export default function App() {
                 <div className="overflow-y-auto flex-1 p-2">
                     <ul className="divide-y divide-slate-100">
                         {labGrouped.map((lab, idx) => (
-                            <li key={idx} className="p-4 hover:bg-slate-50 flex justify-between items-center cursor-pointer" onClick={() => setSelectedLabDetail({ labName: lab, items: inventory.filter(i => i.labName === lab && Number(i.amount) > 0).sort((a,b) => (a.shelf||'미지정').localeCompare(b.shelf||'미지정','ko',{numeric:true})) })}>
+                            <li key={idx} className="p-4 hover:bg-slate-50 flex justify-between items-center cursor-pointer" onClick={() => setSelectedLabDetail({ labName: lab, sortKey: 'shelf', sortDir: 'asc', items: inventory.filter(i => i.labName === lab && Number(i.amount) > 0) })}>
                                 <span className="font-bold text-slate-700 truncate mr-2">{lab}</span>
                                 <button className="text-xs bg-blue-100 text-blue-700 px-3 py-1 rounded-full font-bold flex-shrink-0">보유 목록</button>
                             </li>
@@ -1481,9 +1481,35 @@ export default function App() {
                      <h3 className="text-lg md:text-xl font-bold text-slate-800 border-b pb-3">{selectedLabDetail.labName} 보유품목</h3>
                      <div className="mt-4 flex-1 overflow-x-auto overflow-y-auto">
                          <table className="w-full text-sm text-left min-w-[400px] whitespace-nowrap">
-                             <thead className="bg-slate-50 sticky top-0"><tr><th className="p-2">선반</th><th className="p-2">물질명/제조사</th><th className="p-2 text-right">수량</th></tr></thead>
+                             <thead className="bg-slate-50 sticky top-0">
+                               <tr>
+                                 <th className="p-2 cursor-pointer select-none hover:bg-slate-100 transition"
+                                   onClick={() => setSelectedLabDetail(prev => ({
+                                     ...prev,
+                                     sortKey: 'shelf',
+                                     sortDir: prev.sortKey === 'shelf' ? (prev.sortDir === 'asc' ? 'desc' : 'asc') : 'asc'
+                                   }))}>
+                                   선반 {selectedLabDetail.sortKey === 'shelf' ? (selectedLabDetail.sortDir === 'asc' ? '▲' : '▼') : '⇅'}
+                                 </th>
+                                 <th className="p-2 cursor-pointer select-none hover:bg-slate-100 transition"
+                                   onClick={() => setSelectedLabDetail(prev => ({
+                                     ...prev,
+                                     sortKey: 'chemicalName',
+                                     sortDir: prev.sortKey === 'chemicalName' ? (prev.sortDir === 'asc' ? 'desc' : 'asc') : 'asc'
+                                   }))}>
+                                   물질명/제조사 {selectedLabDetail.sortKey === 'chemicalName' ? (selectedLabDetail.sortDir === 'asc' ? '▲' : '▼') : '⇅'}
+                                 </th>
+                                 <th className="p-2 text-right">수량</th>
+                               </tr>
+                             </thead>
                              <tbody className="divide-y">
-                                 {selectedLabDetail.items.map((item, idx) => (
+                                 {[...selectedLabDetail.items].sort((a, b) => {
+                                   const key = selectedLabDetail.sortKey || 'shelf';
+                                   const dir = selectedLabDetail.sortDir === 'desc' ? -1 : 1;
+                                   const va = (a[key] || '').toString();
+                                   const vb = (b[key] || '').toString();
+                                   return dir * va.localeCompare(vb, 'ko', {numeric: true});
+                                 }).map((item, idx) => (
                                      <tr key={idx}><td className="p-2 font-bold text-blue-600">{item.shelf}</td><td className="p-2"><div className="font-bold">{item.chemicalName}</div><div className="text-xs text-slate-500">{item.manufacturer}</div></td><td className="p-2 text-right font-medium">{item.amount}{item.unit}</td></tr>
                                  ))}
                              </tbody>
@@ -1547,7 +1573,7 @@ export default function App() {
                                             {isExpanded && (
                                                 <div className="bg-slate-50 p-3 text-sm border-t border-slate-100 space-y-2">
                                                     <p className="text-xs font-bold text-slate-400 mb-2">용량 구성 상세내역:</p>
-                                                    {breakdownData[storageName][type].map((detail, idx) => (
+                                                    {[...breakdownData[storageName][type]].sort((a,b) => (a.name||'').localeCompare(b.name||'','ko')).map((detail, idx) => (
                                                         <div key={idx} className="flex justify-between items-center bg-white p-2 rounded shadow-sm border border-slate-100">
                                                             <div className="flex flex-col min-w-0 pr-2">
                                                                 <span className="font-bold text-slate-700 truncate">{detail.name}</span>
@@ -1647,14 +1673,13 @@ export default function App() {
               <th className="p-3">신청자</th>
               <th className="p-3">저장소/실험실</th>
               <th className="p-3">물질/수량</th>
-              <th className="p-3">선반지정</th>
               <th className="p-3">상태</th>
               <th className="p-3 text-center">작업</th>
             </tr>
           </thead>
           <tbody className="divide-y">
             {displayReqs.length === 0 ? (
-                <tr><td colSpan="7" className="p-8 text-center text-slate-500">항목이 없습니다.</td></tr>
+                <tr><td colSpan="6" className="p-8 text-center text-slate-500">항목이 없습니다.</td></tr>
             ) : (
                 displayReqs.map(req => (
                 <tr key={req.id} className={req.status === 'PENDING' ? 'bg-blue-50/30' : req.status === 'APPROVED' ? 'bg-green-50/20' : 'bg-red-50/10'}>
@@ -1662,11 +1687,7 @@ export default function App() {
                     <td className="p-3 font-medium text-slate-700">{req.requestorName || <span className="text-slate-300 text-xs">미입력</span>}</td>
                     <td className="p-3"><div className="font-bold">{req.storage}</div><div className="text-xs text-slate-500">{req.labName}</div></td>
                     <td className="p-3"><div className="font-bold">{req.chemicalName}</div><div className="text-sm text-blue-600">{req.amount}{req.unit}</div><div className="text-xs text-slate-400">{req.manufacturer}</div></td>
-                    <td className="p-3">
-                      {req.type === 'IN'
-                        ? <input type="text" placeholder="미지정" className="border p-1 w-24 rounded text-sm focus:ring-1 focus:ring-blue-400" value={req.shelf === '미지정' ? '' : req.shelf} onChange={e=>setRequests(requests.map(r=>r.id===req.id?{...r, shelf:e.target.value}:r))}/>
-                        : <span className="text-slate-500">{req.shelf || '-'}</span>}
-                    </td>
+
                     <td className="p-3">
                       {req.status === 'PENDING' && <span className="px-2 py-1 bg-yellow-100 text-yellow-700 rounded text-xs font-bold">대기중</span>}
                       {req.status === 'APPROVED' && <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded text-xs font-bold">승인됨</span>}
@@ -1796,7 +1817,7 @@ export default function App() {
                 </td>
               </tr>
             ))}
-            {requests.length === 0 && <tr><td colSpan="7" className="p-8 text-center text-slate-500">신청 내역이 없습니다.</td></tr>}
+            {requests.length === 0 && <tr><td colSpan="6" className="p-8 text-center text-slate-500">신청 내역이 없습니다.</td></tr>}
           </tbody>
         </table>
       </div>

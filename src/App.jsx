@@ -1726,6 +1726,7 @@ export default function App() {
     const displayReqs = approvalViewTab === 'pending' ? pendingReqs : allReqs;
 
     return (
+    <>
     <div className="space-y-4">
       <h2 className="text-xl md:text-2xl font-bold text-slate-800">승인 대기 / 관리</h2>
 
@@ -1943,6 +1944,7 @@ export default function App() {
         </div>
       </div>
     )}
+    </>
   );};
 
   const renderMyRequestsScreen = () => (

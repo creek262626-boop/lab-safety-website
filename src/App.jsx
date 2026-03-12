@@ -4,7 +4,7 @@ import {
   CheckCircle, XCircle, Trash2, Database, ArrowRightLeft, LayoutDashboard, 
   LogOut, FlaskConical, BarChart3, Lock, Filter, Info, History, AlertTriangle,
   Menu, X, ChevronDown, ChevronRight, Trophy, Cloud, WifiOff,
-  Search, Edit2, Upload, FileSpreadsheet, User, Bell, Megaphone, Pin
+  Search, Edit2, Upload, FileSpreadsheet, User, Bell, Megaphone, Pin, PenLine
 } from 'lucide-react';
 
 // --- Firebase Imports ---
@@ -203,6 +203,11 @@ export default function App() {
   const [expandedStats, setExpandedStats] = useState({});
   const [isChemDropdownOpen, setIsChemDropdownOpen] = useState(false);
   const [editingRequest, setEditingRequest] = useState(null); // 승인화면 편집 모달용
+  // ── 서명 모달 상태 ──
+  const [signatureModal, setSignatureModal] = useState({ isOpen: false, req: null, approver: '' });
+  // ── 재고 직접 수정 모달 상태 ──
+  const [editInventoryModal, setEditInventoryModal] = useState({ isOpen: false, invItem: null, req: null });
+  const [editInventoryData, setEditInventoryData] = useState({ amount: '', unit: 'L', shelf: '', manufacturer: '' });
   const [bulkImportModal, setBulkImportModal] = useState(false); // 반출입 일괄 등록 모달
   const [bulkImportRows, setBulkImportRows] = useState([]); // 파싱된 일괄 등록 행
   const [bulkImportErrors, setBulkImportErrors] = useState([]); // 유효성 검사 오류
@@ -349,6 +354,9 @@ export default function App() {
       setActiveTab('dashboard');
       setIsMobileMenuOpen(false);
       setApprovalViewTab('pending');
+      setSignatureModal({ isOpen: false, req: null, approver: '' });
+      setEditInventoryModal({ isOpen: false, invItem: null, req: null });
+      setEditInventoryData({ amount: '', unit: 'L', shelf: '', manufacturer: '' });
   };
 
   const handleAdminLogin = () => {
@@ -392,7 +400,7 @@ export default function App() {
     }
   };
 
-  const approveRequest = async (req) => {
+  const approveRequest = async (req, approver = '') => {
     const isCheckIn = req.type === 'IN';
     const targetAmount = Number(req.amount);
     
@@ -438,7 +446,7 @@ export default function App() {
         
         setInventory(newInventory);
         setRequests(requests.map(r => r.id === req.id ? { ...r, status: 'APPROVED' } : r));
-        setHistory([{ ...req, actionDate: getTodayString(), status: 'APPROVED', processedAt: Date.now() }, ...history]);
+        setHistory([{ ...req, actionDate: getTodayString(), status: 'APPROVED', processedAt: Date.now(), approver: approver || '' }, ...history]);
         return;
     }
 
@@ -497,7 +505,7 @@ export default function App() {
         const histRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'history'));
         batch.set(histRef, { 
             ...req, actionDate: getTodayString(), status: 'APPROVED', 
-            cas: req.cas || '-', originalReqId: req.id, processedAt: Date.now() 
+            cas: req.cas || '-', originalReqId: req.id, processedAt: Date.now(), approver: approver || ''
         });
 
         await batch.commit();
@@ -1233,7 +1241,7 @@ export default function App() {
                 <label className="text-sm font-bold text-slate-700">제조사</label>
                 <select className="border p-3 rounded-lg bg-white focus:ring-2 focus:ring-blue-500 focus:outline-none" value={requestForm.manufacturer} onChange={(e) => setRequestForm({...requestForm, manufacturer: e.target.value})}>
                     <option value="">선택해주세요</option>
-                    {manufacturers.map((m, idx) => (
+                    {[...manufacturers].sort((a,b) => a.name.localeCompare(b.name, 'ko')).map((m, idx) => (
                         <option key={idx} value={m.name}>{m.name}</option>
                     ))}
                 </select>
@@ -1609,6 +1617,72 @@ export default function App() {
     showAlert("완료", "신청 내역이 수정되었습니다.");
   };
 
+  // ── 재고 직접 수정 함수 ──
+  const handleOpenInventoryEdit = (req) => {
+    const invItem = inventory.find(item =>
+      item.storage === req.storage &&
+      item.chemicalName === req.chemicalName &&
+      item.labName === req.labName
+    );
+    setEditInventoryModal({ isOpen: true, invItem: invItem || null, req });
+    setEditInventoryData({
+      amount: invItem ? invItem.amount : req.amount,
+      unit: invItem ? (invItem.unit || req.unit) : req.unit,
+      shelf: invItem ? (invItem.shelf || req.shelf || '') : (req.shelf || ''),
+      manufacturer: invItem ? (invItem.manufacturer || req.manufacturer || '') : (req.manufacturer || ''),
+    });
+  };
+
+  const handleSaveInventoryEdit = async () => {
+    const { invItem, req } = editInventoryModal;
+    const newAmount = Number(editInventoryData.amount);
+    if (!newAmount || newAmount <= 0) {
+      showAlert('오류', '수량은 0보다 커야 합니다.');
+      return;
+    }
+    if (isDemoMode) {
+      if (invItem) {
+        setInventory(inventory.map(i => i.id === invItem.id ? {
+          ...i,
+          amount: newAmount,
+          unit: editInventoryData.unit,
+          shelf: editInventoryData.shelf || '미지정',
+          manufacturer: editInventoryData.manufacturer,
+        } : i));
+      }
+      setEditInventoryModal({ isOpen: false, invItem: null, req: null });
+      showAlert('완료', '재고가 수정되었습니다.');
+      return;
+    }
+    try {
+      const batch = writeBatch(db);
+      if (invItem) {
+        const invRef = doc(db, 'artifacts', appId, 'public', 'data', 'inventory', invItem.id);
+        batch.update(invRef, {
+          amount: newAmount,
+          unit: editInventoryData.unit,
+          shelf: editInventoryData.shelf || '미지정',
+          manufacturer: editInventoryData.manufacturer,
+        });
+      }
+      if (req) {
+        const reqRef = doc(db, 'artifacts', appId, 'public', 'data', 'requests', req.id);
+        batch.update(reqRef, {
+          amount: newAmount,
+          unit: editInventoryData.unit,
+          shelf: editInventoryData.shelf || '미지정',
+          manufacturer: editInventoryData.manufacturer,
+        });
+      }
+      await batch.commit();
+      setEditInventoryModal({ isOpen: false, invItem: null, req: null });
+      showAlert('완료', '재고가 수정되었습니다.');
+    } catch(e) {
+      console.error(e);
+      showAlert('오류', '재고 수정 중 오류가 발생했습니다.');
+    }
+  };
+
   // ── 공지사항 CRUD ──
   const handleSaveNotice = async () => {
     if (!noticeForm.title.trim() || !noticeForm.content.trim()) {
@@ -1697,12 +1771,15 @@ export default function App() {
                         <div className="flex justify-center gap-1">
                         {req.status === 'PENDING' && <>
                           <button onClick={() => setEditingRequest({...req})} className="p-1.5 bg-blue-100 text-blue-700 rounded hover:bg-blue-200 transition" title="내용 수정"><Edit2 size={15}/></button>
-                          <button onClick={() => approveRequest(req)} className="p-1.5 bg-green-500 text-white rounded hover:bg-green-600 transition" title="승인"><CheckCircle size={15}/></button>
+                          <button onClick={() => setSignatureModal({ isOpen: true, req, approver: '' })} className="p-1.5 bg-green-500 text-white rounded hover:bg-green-600 transition" title="승인 (전자서명)"><CheckCircle size={15}/></button>
                           <button onClick={() => rejectRequest(req.id)} className="p-1.5 bg-red-500 text-white rounded hover:bg-red-600 transition" title="거절"><XCircle size={15}/></button>
                         </>}
-                        {req.status !== 'PENDING' && (
+                        {req.status !== 'PENDING' && (<>
+                          {req.status === 'APPROVED' && (
+                            <button onClick={() => handleOpenInventoryEdit(req)} className="p-1.5 bg-blue-100 text-blue-600 rounded hover:bg-blue-200 transition" title="재고 직접 수정"><Edit2 size={15}/></button>
+                          )}
                           <button onClick={() => handleDeleteRequest(req)} className="p-1.5 bg-slate-100 text-slate-500 rounded hover:bg-red-100 hover:text-red-600 transition" title="삭제/롤백"><Trash2 size={15}/></button>
-                        )}
+                        </>)}
                         </div>
                     </td>
                 </tr>
@@ -1773,6 +1850,99 @@ export default function App() {
         </div>
       )}
     </div>
+
+    {/* ─── 서명 입력 모달 ─── */}
+    {signatureModal.isOpen && (
+      <div className="fixed inset-0 bg-black/60 z-[110] flex items-center justify-center p-4">
+        <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-6">
+          <h3 className="text-xl font-bold mb-3 text-slate-800 flex items-center gap-2">
+            <PenLine size={20} className="text-green-600"/> 승인 전자서명
+          </h3>
+          <div className="bg-green-50 border border-green-200 rounded-lg p-3 mb-4 text-sm text-slate-700">
+            <p className="font-bold text-green-700">{signatureModal.req?.type === 'IN' ? '📦 반입' : '📤 반출'} 승인</p>
+            <p className="mt-1">{signatureModal.req?.chemicalName} <span className="font-bold text-blue-600">{signatureModal.req?.amount}{signatureModal.req?.unit}</span></p>
+            <p className="text-xs text-slate-500 mt-0.5">{signatureModal.req?.storage} | {signatureModal.req?.labName}</p>
+          </div>
+          <div>
+            <label className="text-xs font-bold text-slate-600 mb-1 block">승인자 성명 <span className="text-red-500">*</span></label>
+            <input
+              type="text"
+              className="w-full border p-2.5 rounded-lg focus:ring-2 focus:ring-green-500 focus:outline-none"
+              placeholder="승인자 성명을 입력하세요"
+              value={signatureModal.approver}
+              onChange={e => setSignatureModal({...signatureModal, approver: e.target.value})}
+              onKeyDown={e => { if(e.key === 'Enter') { if(!signatureModal.approver.trim()){showAlert('안내','승인자 성명을 입력해주세요.');return;} approveRequest(signatureModal.req, signatureModal.approver.trim()); setSignatureModal({ isOpen: false, req: null, approver: '' }); }}}
+              autoFocus
+            />
+            <p className="text-xs text-slate-400 mt-1">✍️ 입력된 성명이 전자서명으로 반출입 기록에 저장됩니다.</p>
+          </div>
+          <div className="flex gap-3 mt-5 justify-end">
+            <button onClick={() => setSignatureModal({ isOpen: false, req: null, approver: '' })} className="px-4 py-2 bg-slate-200 rounded-lg font-medium hover:bg-slate-300">취소</button>
+            <button onClick={() => {
+              if (!signatureModal.approver.trim()) { showAlert('안내', '승인자 성명을 입력해주세요.'); return; }
+              approveRequest(signatureModal.req, signatureModal.approver.trim());
+              setSignatureModal({ isOpen: false, req: null, approver: '' });
+            }} className="px-5 py-2 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700 flex items-center gap-1.5">
+              <CheckCircle size={16}/> 승인 확정
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+
+    {/* ─── 재고 직접 수정 모달 ─── */}
+    {editInventoryModal.isOpen && (
+      <div className="fixed inset-0 bg-black/60 z-[110] flex items-center justify-center p-4">
+        <div className="bg-white rounded-xl shadow-2xl max-w-md w-full p-6">
+          <h3 className="text-xl font-bold mb-3 text-slate-800 flex items-center gap-2">
+            <Edit2 size={20} className="text-blue-600"/> 승인 재고 직접 수정
+          </h3>
+          <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-2.5 mb-4 text-xs text-slate-600">
+            ⚠️ 이미 승인된 재고를 직접 수정합니다. <strong>{editInventoryModal.req?.chemicalName}</strong> ({editInventoryModal.req?.storage})
+          </div>
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-xs font-bold text-slate-600 mb-1 block">수량 <span className="text-red-500">*</span></label>
+                <input type="number" min="0" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500"
+                  value={editInventoryData.amount}
+                  onChange={e => setEditInventoryData({...editInventoryData, amount: e.target.value})}
+                />
+              </div>
+              <div>
+                <label className="text-xs font-bold text-slate-600 mb-1 block">단위</label>
+                <select className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500"
+                  value={editInventoryData.unit}
+                  onChange={e => setEditInventoryData({...editInventoryData, unit: e.target.value})}>
+                  {['L', 'kg', 'mL', 'g', 'Can', 'Bottle'].map(u => <option key={u}>{u}</option>)}
+                </select>
+              </div>
+            </div>
+            <div>
+              <label className="text-xs font-bold text-slate-600 mb-1 block">선반 번호</label>
+              <input type="text" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500"
+                value={editInventoryData.shelf}
+                onChange={e => setEditInventoryData({...editInventoryData, shelf: e.target.value})}
+                placeholder="예: A-1"
+              />
+            </div>
+            <div>
+              <label className="text-xs font-bold text-slate-600 mb-1 block">제조사</label>
+              <select className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500"
+                value={editInventoryData.manufacturer}
+                onChange={e => setEditInventoryData({...editInventoryData, manufacturer: e.target.value})}>
+                <option value="">선택</option>
+                {[...manufacturers].sort((a,b) => a.name.localeCompare(b.name,'ko')).map((m,i) => <option key={i} value={m.name}>{m.name}</option>)}
+              </select>
+            </div>
+          </div>
+          <div className="flex gap-3 mt-5 justify-end">
+            <button onClick={() => setEditInventoryModal({ isOpen: false, invItem: null, req: null })} className="px-4 py-2 bg-slate-200 rounded-lg font-medium hover:bg-slate-300">취소</button>
+            <button onClick={handleSaveInventoryEdit} className="px-5 py-2 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700">저장</button>
+          </div>
+        </div>
+      </div>
+    )}
   );};
 
   const renderMyRequestsScreen = () => (
@@ -1880,13 +2050,13 @@ export default function App() {
                 </select>
                 <div className="ml-auto w-full md:w-auto">
                     <button onClick={() => {
-                        const csvHeader = "일자,구분,신청자,저장소,선반,실험실,물질명,CAS No.,성상,수량,제조사\n";
+                        const csvHeader = "일자,구분,신청자,저장소,선반,실험실,물질명,CAS No.,성상,수량,제조사,승인자(서명)\n";
                         const csvData = filteredHistory.map(h => {
                             const chemInfo = chemicals.find(c => c.name === h.chemicalName) || {};
                             const casNo = h.cas && h.cas !== '-' ? h.cas : (chemInfo.cas || '-');
                             const chemType = h.chemType || chemInfo.type || '-';
                             const shelfInfo = h.shelf || '미지정';
-                            return `${h.actionDate},${h.type==='IN'?'반입':'반출'},${h.requestorName||'-'},${h.storage},${shelfInfo},${h.labName},${h.chemicalName},${casNo},${chemType},${h.amount}${h.unit},${h.manufacturer}`;
+                            return `${h.actionDate},${h.type==='IN'?'반입':'반출'},${h.requestorName||'-'},${h.storage},${shelfInfo},${h.labName},${h.chemicalName},${casNo},${chemType},${h.amount}${h.unit},${h.manufacturer},${h.approver||'-'}`;
                         }).join("\n");
                         downloadCSV(csvHeader + csvData, "history.csv");
                     }} className="w-full md:w-auto px-4 py-2 bg-green-600 text-white rounded font-bold flex items-center justify-center gap-2 hover:bg-green-700">
@@ -1906,6 +2076,7 @@ export default function App() {
                             <th className="p-3">물질명</th>
                             <th className="p-3">수량</th>
                             <th className="p-3">제조사</th>
+                            <th className="p-3">승인자</th>
                         </tr>
                     </thead>
                     <tbody className="divide-y">
@@ -1938,6 +2109,7 @@ export default function App() {
                                     </td>
                                     <td className="p-3 font-bold text-blue-600">{h.amount}{h.unit}</td>
                                     <td className="p-3 text-slate-500">{h.manufacturer}</td>
+                                    <td className="p-3 text-slate-500">{h.approver ? <span className="flex items-center gap-1"><PenLine size={12} className="text-green-600"/>{h.approver}</span> : <span className="text-slate-300 text-xs">-</span>}</td>
                                 </tr>
                             );
                         })}

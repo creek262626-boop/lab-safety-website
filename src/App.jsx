@@ -1995,6 +1995,7 @@ export default function App() {
     });
 
     return (
+        <>
         <div className="space-y-4">
             <h2 className="text-xl md:text-2xl font-bold text-slate-800 flex items-center gap-2"><ArrowRightLeft className="text-blue-600"/> 반출입 기록 조회</h2>
             <div className="bg-white p-4 rounded-xl shadow-sm border flex flex-wrap gap-3 items-center">
@@ -2122,6 +2123,7 @@ export default function App() {
             </div>
           </div>
         )}
+        </>
     );
   };
 

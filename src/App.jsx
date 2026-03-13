@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   PackagePlus, PackageMinus, Settings, Download, Users, ShieldAlert, 
   CheckCircle, XCircle, Trash2, Database, ArrowRightLeft, LayoutDashboard, 
@@ -165,6 +165,121 @@ const SEED_MANUFACTURERS = [
     { name: '삼전순약공업' }
 ];
 
+
+// ──────────────────────────────────────────────────────────
+// 자필 서명 패드 컴포넌트
+// ──────────────────────────────────────────────────────────
+const SignaturePad = ({ onSave, onClear, resetKey }) => {
+  const canvasRef = useRef(null);
+  const isDrawingRef = useRef(false);
+  const lastPosRef = useRef({ x: 0, y: 0 });
+
+  const clearCanvas = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    onClear();
+  }, [onClear]);
+
+  // resetKey 변경 시 캔버스 초기화
+  useEffect(() => {
+    clearCanvas();
+  }, [resetKey]); // eslint-disable-line
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.strokeStyle = '#1e293b';
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    const getPos = (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+      const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+      return {
+        x: (clientX - rect.left) * scaleX,
+        y: (clientY - rect.top) * scaleY,
+      };
+    };
+
+    const startDraw = (e) => {
+      e.preventDefault();
+      isDrawingRef.current = true;
+      const pos = getPos(e);
+      lastPosRef.current = pos;
+      ctx.beginPath();
+      ctx.moveTo(pos.x, pos.y);
+    };
+
+    const draw = (e) => {
+      e.preventDefault();
+      if (!isDrawingRef.current) return;
+      const pos = getPos(e);
+      ctx.lineTo(pos.x, pos.y);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(pos.x, pos.y);
+      lastPosRef.current = pos;
+    };
+
+    const endDraw = (e) => {
+      if (!isDrawingRef.current) return;
+      isDrawingRef.current = false;
+      onSave(canvas.toDataURL('image/png'));
+    };
+
+    canvas.addEventListener('mousedown', startDraw);
+    canvas.addEventListener('mousemove', draw);
+    canvas.addEventListener('mouseup', endDraw);
+    canvas.addEventListener('mouseleave', endDraw);
+    canvas.addEventListener('touchstart', startDraw, { passive: false });
+    canvas.addEventListener('touchmove', draw, { passive: false });
+    canvas.addEventListener('touchend', endDraw);
+
+    return () => {
+      canvas.removeEventListener('mousedown', startDraw);
+      canvas.removeEventListener('mousemove', draw);
+      canvas.removeEventListener('mouseup', endDraw);
+      canvas.removeEventListener('mouseleave', endDraw);
+      canvas.removeEventListener('touchstart', startDraw);
+      canvas.removeEventListener('touchmove', draw);
+      canvas.removeEventListener('touchend', endDraw);
+    };
+  }, [onSave, onClear]);
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="relative border-2 border-dashed border-blue-300 rounded-xl bg-slate-50 overflow-hidden">
+        <canvas
+          ref={canvasRef}
+          width={600}
+          height={140}
+          className="w-full touch-none block"
+          style={{ cursor: 'crosshair', display: 'block' }}
+        />
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none select-none">
+          <span className="text-slate-300 text-sm font-medium">이 곳에 서명하세요 ✍️</span>
+        </div>
+      </div>
+      <div className="flex justify-end">
+        <button
+          type="button"
+          onClick={clearCanvas}
+          className="text-xs text-red-400 hover:text-red-600 flex items-center gap-1 transition"
+        >
+          <span>↺</span> 서명 초기화
+        </button>
+      </div>
+    </div>
+  );
+};
+
 export default function App() {
   // --- States ---
   const [firebaseInitialized, setFirebaseInitialized] = useState(false);
@@ -213,6 +328,11 @@ export default function App() {
 
   // ── 승인 탭 상태 (훅 위반 수정: renderApprovalScreen 내부에서 이동) ──
   const [approvalViewTab, setApprovalViewTab] = useState('pending');
+
+  // ── 서명 관련 상태 ──
+  const [signatureData, setSignatureData] = useState('');      // 신청 폼 현재 서명 (base64)
+  const [signaturePadKey, setSignaturePadKey] = useState(0);   // 서명 패드 강제 초기화용 key
+  const [signatureViewModal, setSignatureViewModal] = useState(null); // 서명 확인 모달 (이미지 URL)
 
   // --- 1. Firebase Setup ---
   useEffect(() => {
@@ -349,6 +469,9 @@ export default function App() {
       setActiveTab('dashboard');
       setIsMobileMenuOpen(false);
       setApprovalViewTab('pending');
+      setSignatureData('');
+      setSignaturePadKey(k => k + 1);
+      setSignatureViewModal(null);
   };
 
   const handleAdminLogin = () => {
@@ -363,9 +486,12 @@ export default function App() {
   };
 
   // --- CRUD Operations ---
-  const submitRequest = async () => {
-    if (!requestForm.labName || !requestForm.chemicalName || !requestForm.amount || !requestForm.requestorName) {
-      showAlert("안내", "필수 정보(성명 포함)를 모두 입력해주세요."); return;
+  const submitRequest = async (keepForm = false) => {
+    if (!requestForm.labName || !requestForm.chemicalName || !requestForm.amount) {
+      showAlert("안내", "필수 정보(저장소·실험실·물질명·수량)를 모두 입력해주세요."); return;
+    }
+    if (!signatureData) {
+      showAlert("안내", "서명란에 서명을 해주세요."); return;
     }
     const chem = chemicals.find(c => c.name === requestForm.chemicalName);
     const newRequest = { 
@@ -374,7 +500,9 @@ export default function App() {
         date: getTodayString(), 
         shelf: '미지정', 
         chemType: chem ? chem.type : '미지정', 
-        cas: chem ? chem.cas : '-', 
+        cas: chem ? chem.cas : '-',
+        signature: signatureData,
+        requestorName: requestForm.requestorName || '서명자',
         ...requestForm 
     };
     
@@ -384,9 +512,18 @@ export default function App() {
         } else {
             await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'requests'), newRequest);
         }
-        showAlert("성공", "신청이 완료되었습니다.");
-        setRequestForm({ type: 'IN', labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', chemType: '', requestorName: '' });
-        navigateTo('my_requests');
+        if (keepForm) {
+            // 이어서 신청: 저장소·실험실·유형 유지, 물질/수량/제조사/서명 초기화
+            setRequestForm(prev => ({ ...prev, chemicalName: '', amount: '', manufacturer: '', chemType: '', cas: '' }));
+            setSignatureData('');
+            setSignaturePadKey(k => k + 1);
+            showAlert("성공", "신청이 완료되었습니다. 다음 물질을 신청해주세요.");
+        } else {
+            setRequestForm({ type: 'IN', labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', chemType: '', requestorName: '' });
+            setSignatureData('');
+            setSignaturePadKey(k => k + 1);
+            navigateTo('my_requests');
+        }
     } catch (e) {
         showAlert("오류", "신청 중 오류가 발생했습니다.");
     }
@@ -1178,8 +1315,19 @@ export default function App() {
                 <input type="text" className="border p-3 rounded-lg bg-slate-50 text-slate-500" value={requestForm.ext} readOnly placeholder="자동 입력됨" />
             </div>
             <div className="flex flex-col gap-2 md:col-span-2">
-                <label className="text-sm font-bold text-slate-700 flex items-center gap-1"><User size={14} className="text-slate-500"/> 신청자 성명 <span className="text-red-500">*</span></label>
-                <input type="text" className="border p-3 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none" placeholder="반출입을 신청하는 분의 성명을 입력하세요" value={requestForm.requestorName} onChange={(e) => setRequestForm({...requestForm, requestorName: e.target.value})} />
+                <label className="text-sm font-bold text-slate-700 flex items-center gap-1">
+                  ✍️ 신청자 서명 <span className="text-red-500">*</span>
+                  <span className="text-xs font-normal text-slate-400 ml-2">(손가락 또는 마우스로 서명하세요)</span>
+                </label>
+                <SignaturePad
+                  key={signaturePadKey}
+                  resetKey={signaturePadKey}
+                  onSave={(data) => setSignatureData(data)}
+                  onClear={() => setSignatureData('')}
+                />
+                {signatureData && (
+                  <p className="text-xs text-green-600 flex items-center gap-1 mt-0.5">✅ 서명이 완료되었습니다.</p>
+                )}
             </div>
         </div>
 
@@ -1233,16 +1381,21 @@ export default function App() {
                 <label className="text-sm font-bold text-slate-700">제조사</label>
                 <select className="border p-3 rounded-lg bg-white focus:ring-2 focus:ring-blue-500 focus:outline-none" value={requestForm.manufacturer} onChange={(e) => setRequestForm({...requestForm, manufacturer: e.target.value})}>
                     <option value="">선택해주세요</option>
-                    {manufacturers.map((m, idx) => (
+                    {[...manufacturers].sort((a,b) => a.name.localeCompare(b.name, 'ko')).map((m, idx) => (
                         <option key={idx} value={m.name}>{m.name}</option>
                     ))}
                 </select>
             </div>
         </div>
 
-        <button onClick={submitRequest} className={`w-full py-4 rounded-xl font-bold text-lg shadow-lg transition transform active:scale-95 ${requestForm.type === 'IN' ? 'bg-green-600 hover:bg-green-700 text-white' : 'bg-red-600 hover:bg-red-700 text-white'}`}>
-            {requestForm.type === 'IN' ? '반입 신청 완료' : '반출 신청 완료'}
-        </button>
+        <div className="flex flex-col gap-3">
+          <button onClick={() => submitRequest(false)} className={`w-full py-4 rounded-xl font-bold text-lg shadow-lg transition transform active:scale-95 ${requestForm.type === 'IN' ? 'bg-green-600 hover:bg-green-700 text-white' : 'bg-red-600 hover:bg-red-700 text-white'}`}>
+            {requestForm.type === 'IN' ? '📦 반입 신청 완료 (내역으로 이동)' : '📤 반출 신청 완료 (내역으로 이동)'}
+          </button>
+          <button onClick={() => submitRequest(true)} className={`w-full py-3 rounded-xl font-bold text-base border-2 transition transform active:scale-95 ${requestForm.type === 'IN' ? 'border-green-600 text-green-700 hover:bg-green-50' : 'border-red-600 text-red-700 hover:bg-red-50'} bg-white`}>
+            ➕ 이어서 다른 물질 신청 (저장소·실험실 유지)
+          </button>
+        </div>
       </div>
     );
   };
@@ -1666,15 +1819,15 @@ export default function App() {
       </div>
 
       <div className="bg-white rounded-xl shadow border overflow-x-auto">
-        <table className="w-full text-left text-sm whitespace-nowrap min-w-[800px]">
+        <table className="w-full text-left text-sm whitespace-nowrap min-w-[700px]">
           <thead className="bg-slate-50 border-b">
             <tr>
-              <th className="p-3">구분</th>
-              <th className="p-3">신청자</th>
-              <th className="p-3">저장소/실험실</th>
-              <th className="p-3">물질/수량</th>
-              <th className="p-3">상태</th>
-              <th className="p-3 text-center">작업</th>
+              <th className="p-2 md:p-3">구분</th>
+              <th className="p-2 md:p-3">신청자</th>
+              <th className="p-2 md:p-3">저장소/실험실</th>
+              <th className="p-2 md:p-3">물질/수량</th>
+              <th className="p-2 md:p-3">상태</th>
+              <th className="p-2 md:p-3 text-center">작업</th>
             </tr>
           </thead>
           <tbody className="divide-y">
@@ -1683,17 +1836,17 @@ export default function App() {
             ) : (
                 displayReqs.map(req => (
                 <tr key={req.id} className={req.status === 'PENDING' ? 'bg-blue-50/30' : req.status === 'APPROVED' ? 'bg-green-50/20' : 'bg-red-50/10'}>
-                    <td className="p-3"><span className={`px-2 py-1 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{req.type === 'IN' ? '반입' : '반출'}</span></td>
-                    <td className="p-3 font-medium text-slate-700">{req.requestorName || <span className="text-slate-300 text-xs">미입력</span>}</td>
-                    <td className="p-3"><div className="font-bold">{req.storage}</div><div className="text-xs text-slate-500">{req.labName}</div></td>
-                    <td className="p-3"><div className="font-bold">{req.chemicalName}</div><div className="text-sm text-blue-600">{req.amount}{req.unit}</div><div className="text-xs text-slate-400">{req.manufacturer}</div></td>
+                    <td className="p-2 md:p-3"><span className={`px-1.5 py-0.5 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{req.type === 'IN' ? '반입' : '반출'}</span></td>
+                    <td className="p-2 md:p-3 font-medium text-slate-700 text-xs">{req.requestorName ? <span className="flex items-center gap-1">{req.signature && <span title="서명있음" className="text-green-500">✍️</span>}{req.requestorName}</span> : <span className="text-slate-300 text-xs">-</span>}</td>
+                    <td className="p-2 md:p-3"><div className="font-bold text-xs">{req.storage}</div><div className="text-xs text-slate-500">{req.labName}</div></td>
+                    <td className="p-2 md:p-3"><div className="font-bold text-xs">{req.chemicalName}</div><div className="text-xs text-blue-600">{req.amount}{req.unit}</div><div className="text-xs text-slate-400">{req.manufacturer}</div></td>
 
-                    <td className="p-3">
-                      {req.status === 'PENDING' && <span className="px-2 py-1 bg-yellow-100 text-yellow-700 rounded text-xs font-bold">대기중</span>}
-                      {req.status === 'APPROVED' && <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded text-xs font-bold">승인됨</span>}
-                      {req.status === 'REJECTED' && <span className="px-2 py-1 bg-red-100 text-red-700 rounded text-xs font-bold">반려됨</span>}
+                    <td className="p-2 md:p-3">
+                      {req.status === 'PENDING' && <span className="px-1.5 py-0.5 bg-yellow-100 text-yellow-700 rounded text-xs font-bold">대기중</span>}
+                      {req.status === 'APPROVED' && <span className="px-1.5 py-0.5 bg-blue-100 text-blue-700 rounded text-xs font-bold">승인됨</span>}
+                      {req.status === 'REJECTED' && <span className="px-1.5 py-0.5 bg-red-100 text-red-700 rounded text-xs font-bold">반려됨</span>}
                     </td>
-                    <td className="p-3 text-center">
+                    <td className="p-2 md:p-3 text-center">
                         <div className="flex justify-center gap-1">
                         {req.status === 'PENDING' && <>
                           <button onClick={() => setEditingRequest({...req})} className="p-1.5 bg-blue-100 text-blue-700 rounded hover:bg-blue-200 transition" title="내용 수정"><Edit2 size={15}/></button>
@@ -1779,38 +1932,41 @@ export default function App() {
     <div className="space-y-4">
       <h2 className="text-xl md:text-2xl font-bold text-slate-800 flex items-center gap-2"><History className="text-blue-600"/> 내 신청 내역</h2>
       <div className="bg-white rounded-xl shadow border overflow-x-auto">
-        <table className="w-full text-left text-sm whitespace-nowrap min-w-[600px]">
+        <table className="w-full text-left text-sm whitespace-nowrap min-w-[550px]">
           <thead className="bg-slate-50 border-b">
             <tr>
-                <th className="p-3">신청일</th>
-                <th className="p-3">구분</th>
-                <th className="p-3">신청자</th>
-                <th className="p-3">저장소 / 실험실</th>
-                <th className="p-3">물질/수량/제조사</th>
-                <th className="p-3 text-center">상태</th>
-                <th className="p-3 text-center">삭제</th>
+                <th className="p-2 md:p-3">신청일</th>
+                <th className="p-2 md:p-3">구분</th>
+                <th className="p-2 md:p-3">신청자</th>
+                <th className="p-2 md:p-3">저장소 / 실험실</th>
+                <th className="p-2 md:p-3">물질/수량</th>
+                <th className="p-2 md:p-3 text-center">상태</th>
+                <th className="p-2 md:p-3 text-center">삭제</th>
             </tr>
           </thead>
           <tbody className="divide-y">
             {requests.map(req => (
               <tr key={req.id} className="hover:bg-slate-50 transition">
-                <td className="p-3 text-slate-600">{req.date}</td>
-                <td className="p-3"><span className={`px-2 py-1 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{req.type === 'IN' ? '반입' : '반출'}</span></td>
-                <td className="p-3 font-medium text-slate-700">{req.requestorName || <span className="text-slate-300 text-xs">-</span>}</td>
-                <td className="p-3">
-                    <div className="font-bold text-slate-700">{req.storage}</div>
-                    <div className="text-xs text-slate-500 mt-0.5">{req.labName}</div>
+                <td className="p-2 md:p-3 text-xs text-slate-600">{req.date}</td>
+                <td className="p-2 md:p-3"><span className={`px-1.5 py-0.5 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{req.type === 'IN' ? '반입' : '반출'}</span></td>
+                <td className="p-2 md:p-3 text-xs font-medium text-slate-700">
+                  {req.signature && <span title="서명있음" className="inline-block mr-1 text-green-500">✍️</span>}
+                  {req.requestorName || <span className="text-slate-300">-</span>}
                 </td>
-                <td className="p-3">
-                    <div className="font-bold text-slate-800">{req.chemicalName} <span className="text-blue-600 text-xs ml-1 bg-blue-50 px-1 py-0.5 rounded border border-blue-100">{req.amount}{req.unit}</span></div>
-                    <div className="text-xs text-slate-500 mt-0.5">{req.manufacturer}</div>
+                <td className="p-2 md:p-3">
+                    <div className="font-bold text-xs text-slate-700">{req.storage}</div>
+                    <div className="text-xs text-slate-500">{req.labName}</div>
                 </td>
-                <td className="p-3 text-center">
-                    {req.status === 'PENDING' && <span className="px-2 py-1 bg-yellow-100 text-yellow-700 rounded text-xs font-bold">대기중</span>}
-                    {req.status === 'APPROVED' && <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded text-xs font-bold">승인됨</span>}
-                    {req.status === 'REJECTED' && <span className="px-2 py-1 bg-red-100 text-red-700 rounded text-xs font-bold">반려됨</span>}
+                <td className="p-2 md:p-3">
+                    <div className="font-bold text-xs text-slate-800">{req.chemicalName} <span className="text-blue-600 text-xs bg-blue-50 px-1 py-0.5 rounded border border-blue-100">{req.amount}{req.unit}</span></div>
+                    <div className="text-xs text-slate-500">{req.manufacturer}</div>
                 </td>
-                <td className="p-3 text-center">
+                <td className="p-2 md:p-3 text-center">
+                    {req.status === 'PENDING' && <span className="px-1.5 py-0.5 bg-yellow-100 text-yellow-700 rounded text-xs font-bold">대기중</span>}
+                    {req.status === 'APPROVED' && <span className="px-1.5 py-0.5 bg-blue-100 text-blue-700 rounded text-xs font-bold">승인됨</span>}
+                    {req.status === 'REJECTED' && <span className="px-1.5 py-0.5 bg-red-100 text-red-700 rounded text-xs font-bold">반려됨</span>}
+                </td>
+                <td className="p-2 md:p-3 text-center">
                     {req.status === 'PENDING' && (
                         <button onClick={() => handleDeleteRequest(req)} className="text-red-500 p-1.5 bg-red-50 rounded hover:bg-red-100 transition" title="신청 취소/삭제"><Trash2 size={16}/></button>
                     )}
@@ -1880,13 +2036,13 @@ export default function App() {
                 </select>
                 <div className="ml-auto w-full md:w-auto">
                     <button onClick={() => {
-                        const csvHeader = "일자,구분,신청자,저장소,선반,실험실,물질명,CAS No.,성상,수량,제조사\n";
+                        const csvHeader = "일자,구분,신청자,저장소,선반,실험실,물질명,CAS No.,성상,수량,제조사,서명\n";
                         const csvData = filteredHistory.map(h => {
                             const chemInfo = chemicals.find(c => c.name === h.chemicalName) || {};
                             const casNo = h.cas && h.cas !== '-' ? h.cas : (chemInfo.cas || '-');
                             const chemType = h.chemType || chemInfo.type || '-';
                             const shelfInfo = h.shelf || '미지정';
-                            return `${h.actionDate},${h.type==='IN'?'반입':'반출'},${h.requestorName||'-'},${h.storage},${shelfInfo},${h.labName},${h.chemicalName},${casNo},${chemType},${h.amount}${h.unit},${h.manufacturer}`;
+                            return `${h.actionDate},${h.type==='IN'?'반입':'반출'},${h.requestorName||'-'},${h.storage},${shelfInfo},${h.labName},${h.chemicalName},${casNo},${chemType},${h.amount}${h.unit},${h.manufacturer},${h.signature ? '[서명있음]' : '-'}`;
                         }).join("\n");
                         downloadCSV(csvHeader + csvData, "history.csv");
                     }} className="w-full md:w-auto px-4 py-2 bg-green-600 text-white rounded font-bold flex items-center justify-center gap-2 hover:bg-green-700">
@@ -1906,6 +2062,7 @@ export default function App() {
                             <th className="p-3">물질명</th>
                             <th className="p-3">수량</th>
                             <th className="p-3">제조사</th>
+                            <th className="p-3 text-center">서명</th>
                         </tr>
                     </thead>
                     <tbody className="divide-y">
@@ -1938,6 +2095,12 @@ export default function App() {
                                     </td>
                                     <td className="p-3 font-bold text-blue-600">{h.amount}{h.unit}</td>
                                     <td className="p-3 text-slate-500">{h.manufacturer}</td>
+                                    <td className="p-3 text-center">
+                                      {h.signature
+                                        ? <button onClick={() => setSignatureViewModal(h.signature)} className="inline-flex items-center gap-1 px-2 py-1 bg-green-50 border border-green-200 text-green-700 rounded text-xs hover:bg-green-100 transition" title="서명 확인">✍️ 보기</button>
+                                        : <span className="text-slate-300 text-xs">없음</span>
+                                      }
+                                    </td>
                                 </tr>
                             );
                         })}
@@ -1946,6 +2109,19 @@ export default function App() {
                 </table>
             </div>
         </div>
+
+        {/* 서명 확인 모달 */}
+        {signatureViewModal && (
+          <div className="fixed inset-0 bg-black/70 z-[120] flex items-center justify-center p-4" onClick={() => setSignatureViewModal(null)}>
+            <div className="bg-white rounded-2xl shadow-2xl p-5 max-w-md w-full" onClick={e => e.stopPropagation()}>
+              <h3 className="text-lg font-bold mb-3 text-slate-800 flex items-center gap-2">✍️ 서명 확인</h3>
+              <div className="border rounded-xl overflow-hidden bg-slate-50">
+                <img src={signatureViewModal} alt="서명" className="w-full object-contain" style={{maxHeight:'200px'}} />
+              </div>
+              <button onClick={() => setSignatureViewModal(null)} className="mt-4 w-full py-2.5 bg-slate-800 text-white rounded-lg font-bold hover:bg-slate-900 transition">닫기</button>
+            </div>
+          </div>
+        )}
     );
   };
 

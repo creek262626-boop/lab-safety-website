@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   PackagePlus, PackageMinus, Settings, Download, Users, ShieldAlert, 
   CheckCircle, XCircle, Trash2, Database, ArrowRightLeft, LayoutDashboard, 
-  LogOut, FlaskConical, BarChart3, Lock, Filter, Info, History, AlertTriangle,
+  LogOut, FlaskConical, ClipboardList, BarChart3, Lock, Filter, Info, History, AlertTriangle,
   Menu, X, ChevronDown, ChevronRight, Trophy, Cloud, WifiOff,
   Search, Edit2, Upload, FileSpreadsheet, User, Bell, Megaphone, Pin
 } from 'lucide-react';
@@ -490,6 +490,9 @@ export default function App() {
     if (!requestForm.labName || !requestForm.chemicalName || !requestForm.amount) {
       showAlert("안내", "필수 정보(저장소·실험실·물질명·수량)를 모두 입력해주세요."); return;
     }
+    if (!requestForm.requestorName || !requestForm.requestorName.trim()) {
+      showAlert("안내", "신청자 성명을 입력해주세요."); return;
+    }
     if (!signatureData) {
       showAlert("안내", "서명란에 서명을 해주세요."); return;
     }
@@ -513,10 +516,9 @@ export default function App() {
             await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'requests'), newRequest);
         }
         if (keepForm) {
-            // 이어서 신청: 저장소·실험실·유형 유지, 물질/수량/제조사/서명 초기화
+            // 이어서 신청: 저장소·실험실·유형·이름·서명 유지, 물질/수량/제조사만 초기화
             setRequestForm(prev => ({ ...prev, chemicalName: '', amount: '', manufacturer: '', chemType: '', cas: '' }));
-            setSignatureData('');
-            setSignaturePadKey(k => k + 1);
+            // signatureData, requestorName은 유지 (초기화하지 않음)
             showAlert("성공", "신청이 완료되었습니다. 다음 물질을 신청해주세요.");
         } else {
             setRequestForm({ type: 'IN', labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', chemType: '', requestorName: '' });
@@ -1244,6 +1246,7 @@ export default function App() {
               <NavItem tab="dashboard" icon={LayoutDashboard} label="대시보드" />
               <NavItem tab="notices" icon={Megaphone} label="공지사항 관리" badge={notices.filter(n=>n.important).length} />
               <NavItem tab="public_status" icon={FlaskConical} label="보관 현황 및 백업" />
+              <NavItem tab="admin_inventory" icon={ClipboardList} label="재고 현황 조회·내보내기" />
               <NavItem tab="safety_status" icon={BarChart3} label="성상별 통계" />
               <NavItem tab="approvals" icon={CheckCircle} label="승인 대기/관리" badge={requests.filter(r => r.status === 'PENDING').length} />
               <NavItem tab="history" icon={ArrowRightLeft} label="반출입 기록 조회" />
@@ -1313,6 +1316,16 @@ export default function App() {
             <div className="flex flex-col gap-2">
                 <label className="text-sm font-bold text-slate-700">내선번호</label>
                 <input type="text" className="border p-3 rounded-lg bg-slate-50 text-slate-500" value={requestForm.ext} readOnly placeholder="자동 입력됨" />
+            </div>
+            <div className="flex flex-col gap-2 md:col-span-2">
+                <label className="text-sm font-bold text-slate-700">신청자 성명 <span className="text-red-500">*</span></label>
+                <input
+                  type="text"
+                  className="border p-3 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  placeholder="반출입을 신청하는 분의 성명을 입력하세요"
+                  value={requestForm.requestorName}
+                  onChange={e => setRequestForm({...requestForm, requestorName: e.target.value})}
+                />
             </div>
             <div className="flex flex-col gap-2 md:col-span-2">
                 <label className="text-sm font-bold text-slate-700 flex items-center gap-1">
@@ -1535,6 +1548,129 @@ export default function App() {
                     </table>
                 </div>
             </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderAdminInventoryScreen = () => {
+    const [invFilter, setInvFilter] = React.useState({ storage: 'All', labName: 'All', chemType: 'All' });
+    
+    const allStorages = [...new Set(inventory.map(i => i.storage).filter(Boolean))].sort((a,b) => a.localeCompare(b,'ko'));
+    const allLabs = [...new Set(inventory.filter(i => invFilter.storage === 'All' || i.storage === invFilter.storage).map(i => i.labName).filter(Boolean))].sort((a,b) => a.localeCompare(b,'ko'));
+    const allChemTypes = [...new Set(inventory.map(i => i.chemType || '미지정').filter(Boolean))].sort((a,b) => a.localeCompare(b,'ko'));
+
+    const filteredInv = inventory.filter(i => {
+      const activeAmount = Number(i.amount) > 0;
+      const matchStorage = invFilter.storage === 'All' || i.storage === invFilter.storage;
+      const matchLab = invFilter.labName === 'All' || i.labName === invFilter.labName;
+      const matchType = invFilter.chemType === 'All' || (i.chemType || '미지정') === invFilter.chemType;
+      return activeAmount && matchStorage && matchLab && matchType;
+    }).sort((a,b) => {
+      const sComp = (a.storage||'').localeCompare(b.storage||'','ko');
+      if (sComp !== 0) return sComp;
+      const lComp = (a.labName||'').localeCompare(b.labName||'','ko');
+      if (lComp !== 0) return lComp;
+      return (a.chemicalName||'').localeCompare(b.chemicalName||'','ko');
+    });
+
+    const downloadInventoryCSV = () => {
+      const header = "저장소,실험실,선반,물질명,CAS No.,성상,수량,단위,제조사\n";
+      const rows = filteredInv.map(i => {
+        const chem = chemicals.find(c => c.name === i.chemicalName);
+        const cas = (chem ? chem.cas : i.cas) || '-';
+        const ct = i.chemType || (chem ? chem.type : '미지정') || '미지정';
+        const safe = v => (String(v||'-').includes(',') ? `"${v}"` : (v||'-'));
+        return [safe(i.storage), safe(i.labName), safe(i.shelf||'미지정'), safe(i.chemicalName), safe(cas), safe(ct), safe(i.amount), safe(i.unit), safe(i.manufacturer)].join(',');
+      }).join("\n");
+      const today = getTodayString();
+      downloadCSV(header + rows, `재고현황_${today}.csv`);
+    };
+
+    return (
+      <div className="space-y-4 md:space-y-6">
+        <h2 className="text-xl md:text-2xl font-bold text-slate-800 flex items-center gap-2">
+          <ClipboardList className="text-blue-600" /> 재고 현황 조회·내보내기
+        </h2>
+
+        {/* 필터 영역 */}
+        <div className="bg-white p-4 rounded-xl shadow-sm border">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">저장소</label>
+              <select className="border p-2 rounded-lg bg-white text-sm focus:ring-2 focus:ring-blue-500"
+                value={invFilter.storage}
+                onChange={e => setInvFilter(f => ({...f, storage: e.target.value, labName: 'All'}))}>
+                <option value="All">전체 저장소</option>
+                {allStorages.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">실험실</label>
+              <select className="border p-2 rounded-lg bg-white text-sm focus:ring-2 focus:ring-blue-500"
+                value={invFilter.labName}
+                onChange={e => setInvFilter(f => ({...f, labName: e.target.value}))}>
+                <option value="All">전체 실험실</option>
+                {allLabs.map(l => <option key={l} value={l}>{l}</option>)}
+              </select>
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">성상(물질종류)</label>
+              <select className="border p-2 rounded-lg bg-white text-sm focus:ring-2 focus:ring-blue-500"
+                value={invFilter.chemType}
+                onChange={e => setInvFilter(f => ({...f, chemType: e.target.value}))}>
+                <option value="All">전체 성상</option>
+                {allChemTypes.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+          </div>
+          <div className="flex items-center justify-between mt-3 pt-3 border-t">
+            <p className="text-sm text-slate-500">검색 결과: <strong className="text-slate-800">{filteredInv.length}건</strong></p>
+            <button
+              onClick={downloadInventoryCSV}
+              className="flex items-center gap-2 bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg text-sm font-bold shadow transition">
+              <Download size={16}/> 엑셀(CSV) 다운로드
+            </button>
+          </div>
+        </div>
+
+        {/* 재고 목록 테이블 */}
+        <div className="bg-white rounded-xl shadow border overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm text-left min-w-[700px]">
+              <thead className="bg-slate-50 border-b">
+                <tr>
+                  {['저장소','실험실','선반','물질명','CAS No.','성상','수량','단위','제조사'].map(h => (
+                    <th key={h} className="p-3 text-xs font-bold text-slate-500 uppercase tracking-wider whitespace-nowrap">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {filteredInv.length === 0 ? (
+                  <tr><td colSpan={9} className="p-8 text-center text-slate-400">해당 조건의 재고가 없습니다.</td></tr>
+                ) : filteredInv.map((item, idx) => {
+                  const chem = chemicals.find(c => c.name === item.chemicalName);
+                  const cas = (chem ? chem.cas : item.cas) || '-';
+                  const ct = item.chemType || (chem ? chem.type : '미지정') || '미지정';
+                  return (
+                    <tr key={idx} className="hover:bg-blue-50 transition">
+                      <td className="p-3 text-xs text-slate-500 whitespace-nowrap">{item.storage}</td>
+                      <td className="p-3 font-medium text-slate-800 whitespace-nowrap">{item.labName}</td>
+                      <td className="p-3 text-blue-600 font-bold whitespace-nowrap">{item.shelf || '미지정'}</td>
+                      <td className="p-3 font-bold text-slate-800 whitespace-nowrap">{item.chemicalName}</td>
+                      <td className="p-3 text-xs text-slate-400 whitespace-nowrap font-mono">{cas}</td>
+                      <td className="p-3 whitespace-nowrap">
+                        <span className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded font-medium">{ct}</span>
+                      </td>
+                      <td className="p-3 font-bold text-right text-blue-700 whitespace-nowrap">{item.amount}</td>
+                      <td className="p-3 text-slate-500 whitespace-nowrap">{item.unit}</td>
+                      <td className="p-3 text-slate-600 whitespace-nowrap">{item.manufacturer || '-'}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     );
@@ -2347,6 +2483,7 @@ export default function App() {
                     {activeTab === 'notices' && renderNoticesScreen()}
                     {activeTab === 'approvals' && renderApprovalScreen()}
                     {activeTab === 'request' && renderRequestFormScreen()}
+                    {activeTab === 'admin_inventory' && renderAdminInventoryScreen()}
                     {activeTab === 'public_status' && renderStorageStatusScreen()}
                     {activeTab === 'safety_status' && renderSafetyStatusScreen()}
                     {activeTab === 'my_requests' && renderMyRequestsScreen()}

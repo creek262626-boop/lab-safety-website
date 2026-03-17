@@ -333,6 +333,7 @@ export default function App() {
   const [signatureData, setSignatureData] = useState('');      // 신청 폼 현재 서명 (base64)
   const [signaturePadKey, setSignaturePadKey] = useState(0);   // 서명 패드 강제 초기화용 key
   const [signatureViewModal, setSignatureViewModal] = useState(null); // 서명 확인 모달 (이미지 URL)
+  const [invFilter, setInvFilter] = useState({ storage: 'All', labName: 'All', chemType: 'All' }); // 재고 현황 조회 필터
 
   // --- 1. Firebase Setup ---
   useEffect(() => {
@@ -472,6 +473,7 @@ export default function App() {
       setSignatureData('');
       setSignaturePadKey(k => k + 1);
       setSignatureViewModal(null);
+      setInvFilter({ storage: 'All', labName: 'All', chemType: 'All' });
   };
 
   const handleAdminLogin = () => {
@@ -1554,8 +1556,6 @@ export default function App() {
   };
 
   const renderAdminInventoryScreen = () => {
-    const [invFilter, setInvFilter] = React.useState({ storage: 'All', labName: 'All', chemType: 'All' });
-    
     const allStorages = [...new Set(inventory.map(i => i.storage).filter(Boolean))].sort((a,b) => a.localeCompare(b,'ko'));
     const allLabs = [...new Set(inventory.filter(i => invFilter.storage === 'All' || i.storage === invFilter.storage).map(i => i.labName).filter(Boolean))].sort((a,b) => a.localeCompare(b,'ko'));
     const allChemTypes = [...new Set(inventory.map(i => i.chemType || '미지정').filter(Boolean))].sort((a,b) => a.localeCompare(b,'ko'));

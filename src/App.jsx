@@ -353,9 +353,8 @@ export default function App() {
   const [signatureData, setSignatureData] = useState('');      // 신청 폼 현재 서명 (base64)
   const [signaturePadKey, setSignaturePadKey] = useState(0);   // 서명 패드 강제 초기화용 key
   const [signatureViewModal, setSignatureViewModal] = useState(null); // 서명 확인 모달 (이미지 URL)
-  const [invFilter, setInvFilter] = useState({ storage: 'All', labName: 'All', chemType: 'All' }); // 재고 현황 조회 필터
+  const [invFilter, setInvFilter] = useState({ storage: 'All', labName: 'All' }); // 재고 현황 조회 필터
   const [invSort, setInvSort] = useState({ key: 'storage', dir: 'asc' }); // 재고 현황 정렬
-  const [editHistoryItem, setEditHistoryItem] = useState(null); // 반출입 기록 수정 모달
 
   // --- 1. Firebase Setup ---
   useEffect(() => {
@@ -495,9 +494,8 @@ export default function App() {
       setSignatureData('');
       setSignaturePadKey(k => k + 1);
       setSignatureViewModal(null);
-      setInvFilter({ storage: 'All', labName: 'All', chemType: 'All' });
+      setInvFilter({ storage: 'All', labName: 'All' });
       setInvSort({ key: 'storage', dir: 'asc' });
-      setEditHistoryItem(null);
   };
 
   const handleAdminLogin = () => {
@@ -584,10 +582,16 @@ export default function App() {
             }
         } else {
             let remaining = targetAmount;
-            const candidates = newInventory.filter(item => 
+            // labName 일치 먼저 시도 → 없으면 storage+chemicalName만으로 fallback
+            let candidates = newInventory.filter(item => 
                 item.storage === req.storage && item.chemicalName === req.chemicalName && item.labName === req.labName
             );
-            if (candidates.length === 0) { showAlert("실패", "재고 부족"); return; }
+            if (candidates.length === 0) {
+                candidates = newInventory.filter(item => 
+                    item.storage === req.storage && item.chemicalName === req.chemicalName
+                );
+            }
+            if (candidates.length === 0) { showAlert("실패", "재고 부족: 해당 저장소에 " + req.chemicalName + " 재고가 없습니다."); return; }
             
             for (let item of candidates) {
                 if (remaining <= 0) break;
@@ -631,10 +635,16 @@ export default function App() {
             }
         } else {
             let remaining = targetAmount;
-            const candidates = inventory.filter(item => 
+            // labName 일치 먼저 시도 → 없으면 storage+chemicalName만으로 fallback
+            let candidates = inventory.filter(item => 
                 item.storage === req.storage && item.chemicalName === req.chemicalName && item.labName === req.labName
             );
-            if (candidates.length === 0) { showAlert("실패", "해당 조건의 재고가 없습니다."); return; }
+            if (candidates.length === 0) {
+                candidates = inventory.filter(item => 
+                    item.storage === req.storage && item.chemicalName === req.chemicalName
+                );
+            }
+            if (candidates.length === 0) { showAlert("실패", "해당 저장소에 " + req.chemicalName + " 재고가 없습니다.\n[저장소: " + req.storage + "]"); return; }
 
             for (let item of candidates) {
                 if (remaining <= 0) break;
@@ -1582,20 +1592,16 @@ export default function App() {
   const renderAdminInventoryScreen = () => {
     const allStorages = [...new Set(inventory.map(i => i.storage).filter(Boolean))].sort((a,b) => a.localeCompare(b,'ko'));
     const allLabs = [...new Set(inventory.filter(i => invFilter.storage === 'All' || i.storage === invFilter.storage).map(i => i.labName).filter(Boolean))].sort((a,b) => a.localeCompare(b,'ko'));
-    const allChemTypes = [...new Set(inventory.map(i => i.chemType || '미지정').filter(Boolean))].sort((a,b) => a.localeCompare(b,'ko'));
 
     const filteredInv = inventory.filter(i => {
       const activeAmount = Number(i.amount) > 0;
       const matchStorage = invFilter.storage === 'All' || i.storage === invFilter.storage;
       const matchLab = invFilter.labName === 'All' || i.labName === invFilter.labName;
-      const matchType = invFilter.chemType === 'All' || (i.chemType || '미지정') === invFilter.chemType;
-      return activeAmount && matchStorage && matchLab && matchType;
+      return activeAmount && matchStorage && matchLab;
     }).sort((a,b) => {
       const dir = invSort.dir === 'asc' ? 1 : -1;
       const key = invSort.key;
-      // 성상(chemType) 정렬은 물질명(chemicalName) 기준으로 처리
       const getVal = item => {
-        if (key === 'chemType') return item.chemicalName || '';
         return item[key] || '';
       };
       return getVal(a).localeCompare(getVal(b), 'ko', {numeric: true}) * dir;
@@ -1626,7 +1632,7 @@ export default function App() {
 
         {/* 필터 영역 */}
         <div className="bg-white p-4 rounded-xl shadow-sm border">
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="flex flex-col gap-1">
               <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">저장소</label>
               <select className="border p-2 rounded-lg bg-white text-sm focus:ring-2 focus:ring-blue-500"
@@ -1645,15 +1651,7 @@ export default function App() {
                 {allLabs.map(l => <option key={l} value={l}>{l}</option>)}
               </select>
             </div>
-            <div className="flex flex-col gap-1">
-              <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">성상(물질종류)</label>
-              <select className="border p-2 rounded-lg bg-white text-sm focus:ring-2 focus:ring-blue-500"
-                value={invFilter.chemType}
-                onChange={e => setInvFilter(f => ({...f, chemType: e.target.value}))}>
-                <option value="All">전체 성상</option>
-                {allChemTypes.map(t => <option key={t} value={t}>{t}</option>)}
-              </select>
-            </div>
+
           </div>
           <div className="flex items-center justify-between mt-3 pt-3 border-t">
             <p className="text-sm text-slate-500">검색 결과: <strong className="text-slate-800">{filteredInv.length}건</strong></p>
@@ -1677,7 +1675,7 @@ export default function App() {
                     {label:'선반',   key:'shelf'},
                     {label:'물질명', key:'chemicalName'},
                     {label:'CAS No.', key:null},
-                    {label:'성상',   key:'chemType'},
+                    {label:'성상',   key:null},
                     {label:'수량',   key:null},
                     {label:'단위',   key:null},
                     {label:'제조사', key:null},
@@ -1943,19 +1941,7 @@ export default function App() {
     showAlert("완료", "신청 내역이 수정되었습니다.");
   };
 
-  // ── 기록 수정 ──
-  const saveEditedHistory = async (updated) => {
-    const { id, ...data } = updated;
-    if (isDemoMode) {
-      setHistory(prev => prev.map(h => h.id === id ? { ...h, ...data } : h));
-    } else {
-      try {
-        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'history', id), data);
-      } catch(e) { showAlert('오류', '기록 수정에 실패했습니다.'); return; }
-    }
-    setEditHistoryItem(null);
-    showAlert('완료', '기록이 수정되었습니다.');
-  };
+
 
   // ── 공지사항 CRUD ──
   const handleSaveNotice = async () => {
@@ -2308,7 +2294,6 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
                             <th className="p-3">수량</th>
                             <th className="p-3">제조사</th>
                             <th className="p-3 text-center">서명</th>
-                            {currentUser === 'admin' && <th className="p-3 text-center">수정</th>}
                         </tr>
                     </thead>
                     <tbody className="divide-y">
@@ -2347,14 +2332,7 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
                                         : <span className="text-slate-300 text-xs">없음</span>
                                       }
                                     </td>
-                                    {currentUser === 'admin' && (
-                                      <td className="p-3 text-center">
-                                        <button onClick={() => setEditHistoryItem({...h})}
-                                          className="inline-flex items-center gap-1 px-2 py-1 bg-amber-50 border border-amber-200 text-amber-700 rounded text-xs hover:bg-amber-100 transition">
-                                          ✏️ 수정
-                                        </button>
-                                      </td>
-                                    )}
+
                                 </tr>
                             );
                         })}
@@ -2377,70 +2355,7 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
           </div>
         )}
 
-        {/* 기록 수정 모달 (관리자 전용) */}
-        {editHistoryItem && (
-          <div className="fixed inset-0 bg-black/60 z-[120] flex items-center justify-center p-4" onClick={() => setEditHistoryItem(null)}>
-            <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-lg" onClick={e => e.stopPropagation()}>
-              <h3 className="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2">✏️ 반출입 기록 수정
-                <span className="text-xs font-normal text-amber-600 bg-amber-50 px-2 py-0.5 rounded border border-amber-200 ml-1">관리자 전용</span>
-              </h3>
-              <div className="grid grid-cols-2 gap-3 text-sm">
-                <div className="flex flex-col gap-1">
-                  <label className="text-xs font-bold text-slate-500">처리일자</label>
-                  <input type="date" className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.actionDate||''} onChange={e=>setEditHistoryItem({...editHistoryItem, actionDate: e.target.value})}/>
-                </div>
-                <div className="flex flex-col gap-1">
-                  <label className="text-xs font-bold text-slate-500">구분</label>
-                  <select className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.type} onChange={e=>setEditHistoryItem({...editHistoryItem, type: e.target.value})}>
-                    <option value="IN">반입</option><option value="OUT">반출</option>
-                  </select>
-                </div>
-                <div className="flex flex-col gap-1">
-                  <label className="text-xs font-bold text-slate-500">저장소</label>
-                  <input type="text" className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.storage||''} onChange={e=>setEditHistoryItem({...editHistoryItem, storage: e.target.value})}/>
-                </div>
-                <div className="flex flex-col gap-1">
-                  <label className="text-xs font-bold text-slate-500">실험실</label>
-                  <input type="text" className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.labName||''} onChange={e=>setEditHistoryItem({...editHistoryItem, labName: e.target.value})}/>
-                </div>
-                <div className="flex flex-col gap-1">
-                  <label className="text-xs font-bold text-slate-500">선반</label>
-                  <input type="text" className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.shelf||''} onChange={e=>setEditHistoryItem({...editHistoryItem, shelf: e.target.value})} placeholder="미지정"/>
-                </div>
-                <div className="flex flex-col gap-1">
-                  <label className="text-xs font-bold text-slate-500">신청자</label>
-                  <input type="text" className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.requestorName||''} onChange={e=>setEditHistoryItem({...editHistoryItem, requestorName: e.target.value})}/>
-                </div>
-                <div className="flex flex-col gap-1 col-span-2">
-                  <label className="text-xs font-bold text-slate-500">물질명</label>
-                  <input type="text" className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.chemicalName||''} onChange={e=>setEditHistoryItem({...editHistoryItem, chemicalName: e.target.value})}/>
-                </div>
-                <div className="flex flex-col gap-1">
-                  <label className="text-xs font-bold text-slate-500">수량</label>
-                  <input type="number" className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.amount||''} onChange={e=>setEditHistoryItem({...editHistoryItem, amount: e.target.value})}/>
-                </div>
-                <div className="flex flex-col gap-1">
-                  <label className="text-xs font-bold text-slate-500">단위</label>
-                  <select className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.unit||'L'} onChange={e=>setEditHistoryItem({...editHistoryItem, unit: e.target.value})}>
-                    {['L','kg','mL','g','Can','Bottle'].map(u=><option key={u} value={u}>{u}</option>)}
-                  </select>
-                </div>
-                <div className="flex flex-col gap-1 col-span-2">
-                  <label className="text-xs font-bold text-slate-500">제조사</label>
-                  <select className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.manufacturer||''} onChange={e=>setEditHistoryItem({...editHistoryItem, manufacturer: e.target.value})}>
-                    <option value="">선택</option>
-                    {[...manufacturers].sort((a,b)=>a.name.localeCompare(b.name,'ko')).map((m,i)=><option key={i} value={m.name}>{m.name}</option>)}
-                  </select>
-                </div>
-              </div>
-              <p className="text-xs text-amber-600 mt-3 bg-amber-50 p-2 rounded border border-amber-100">⚠️ 수정 시 실제 재고(inventory)에는 반영되지 않으며, 기록만 변경됩니다.</p>
-              <div className="flex gap-3 mt-4">
-                <button onClick={() => setEditHistoryItem(null)} className="flex-1 py-2.5 border rounded-lg font-bold text-slate-600 hover:bg-slate-50">취소</button>
-                <button onClick={() => saveEditedHistory(editHistoryItem)} className="flex-1 py-2.5 bg-amber-500 hover:bg-amber-600 text-white rounded-lg font-bold">저장</button>
-              </div>
-            </div>
-          </div>
-        )}
+
         </>
     );
   };

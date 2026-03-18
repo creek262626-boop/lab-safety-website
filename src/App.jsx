@@ -10,6 +10,26 @@ import {
 // --- Firebase Imports ---
 import { initializeApp } from "firebase/app";
 import { getAuth, signInAnonymously, onAuthStateChanged } from "firebase/auth";
+/*
+ * ⚠️ Firebase 보안 강화 안내 (Firestore Security Rules)
+ * Firebase 콘솔 → Firestore → Rules 탭에서 아래 규칙으로 교체하세요:
+ *
+ * rules_version = '2';
+ * service cloud.firestore {
+ *   match /databases/{database}/documents {
+ *     // 공개 읽기는 허용하되, 쓰기는 인증된 사용자만 허용
+ *     match /artifacts/{appId}/public/data/{collection}/{docId} {
+ *       allow read: if request.auth != null;  // 익명 인증 포함
+ *       allow write: if request.auth != null;
+ *     }
+ *   }
+ * }
+ *
+ * 위 규칙을 적용하면 Firebase 콘솔에서 발급한 익명 토큰 없이는
+ * 직접 URL로 접근해도 데이터 읽기/쓰기가 불가합니다.
+ * 추가 강화: Firebase Authentication → 로그인 제공업체에서
+ * "익명" 만 활성화하고 나머지는 비활성화하세요.
+ */
 import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, query, writeBatch } from "firebase/firestore";
 
 // 🔴 [수정 필요] 아래 값들을 Firebase 콘솔에서 복사한 값으로 바꿔주세요.
@@ -334,6 +354,8 @@ export default function App() {
   const [signaturePadKey, setSignaturePadKey] = useState(0);   // 서명 패드 강제 초기화용 key
   const [signatureViewModal, setSignatureViewModal] = useState(null); // 서명 확인 모달 (이미지 URL)
   const [invFilter, setInvFilter] = useState({ storage: 'All', labName: 'All', chemType: 'All' }); // 재고 현황 조회 필터
+  const [invSort, setInvSort] = useState({ key: 'storage', dir: 'asc' }); // 재고 현황 정렬
+  const [editHistoryItem, setEditHistoryItem] = useState(null); // 반출입 기록 수정 모달
 
   // --- 1. Firebase Setup ---
   useEffect(() => {
@@ -474,6 +496,8 @@ export default function App() {
       setSignaturePadKey(k => k + 1);
       setSignatureViewModal(null);
       setInvFilter({ storage: 'All', labName: 'All', chemType: 'All' });
+      setInvSort({ key: 'storage', dir: 'asc' });
+      setEditHistoryItem(null);
   };
 
   const handleAdminLogin = () => {
@@ -1567,12 +1591,17 @@ export default function App() {
       const matchType = invFilter.chemType === 'All' || (i.chemType || '미지정') === invFilter.chemType;
       return activeAmount && matchStorage && matchLab && matchType;
     }).sort((a,b) => {
-      const sComp = (a.storage||'').localeCompare(b.storage||'','ko');
-      if (sComp !== 0) return sComp;
-      const lComp = (a.labName||'').localeCompare(b.labName||'','ko');
-      if (lComp !== 0) return lComp;
-      return (a.chemicalName||'').localeCompare(b.chemicalName||'','ko');
+      const dir = invSort.dir === 'asc' ? 1 : -1;
+      const key = invSort.key;
+      // 성상(chemType) 정렬은 물질명(chemicalName) 기준으로 처리
+      const getVal = item => {
+        if (key === 'chemType') return item.chemicalName || '';
+        return item[key] || '';
+      };
+      return getVal(a).localeCompare(getVal(b), 'ko', {numeric: true}) * dir;
     });
+    const toggleSort = (key) => setInvSort(prev => ({ key, dir: prev.key === key && prev.dir === 'asc' ? 'desc' : 'asc' }));
+    const sortIcon = (key) => invSort.key === key ? (invSort.dir === 'asc' ? ' ▲' : ' ▼') : ' ⇅';
 
     const downloadInventoryCSV = () => {
       const header = "저장소,실험실,선반,물질명,CAS No.,성상,수량,단위,제조사\n";
@@ -1580,8 +1609,10 @@ export default function App() {
         const chem = chemicals.find(c => c.name === i.chemicalName);
         const cas = (chem ? chem.cas : i.cas) || '-';
         const ct = i.chemType || (chem ? chem.type : '미지정') || '미지정';
-        const safe = v => (String(v||'-').includes(',') ? `"${v}"` : (v||'-'));
-        return [safe(i.storage), safe(i.labName), safe(i.shelf||'미지정'), safe(i.chemicalName), safe(cas), safe(ct), safe(i.amount), safe(i.unit), safe(i.manufacturer)].join(',');
+        // ="값" 형식 → 엑셀 텍스트 강제, 쉼표 포함 필드도 안전
+        const safeT = v => `="` + String(v||'-').replace(/"/g, '""') + '"';
+        const safeN = v => String(v||'-'); // 수량은 숫자 그대로
+        return [safeT(i.storage), safeT(i.labName), safeT(i.shelf||'미지정'), safeT(i.chemicalName), safeT(cas), safeT(ct), safeN(i.amount), safeT(i.unit), safeT(i.manufacturer)].join(',');
       }).join("\n");
       const today = getTodayString();
       downloadCSV(header + rows, `재고현황_${today}.csv`);
@@ -1640,8 +1671,22 @@ export default function App() {
             <table className="w-full text-sm text-left min-w-[700px]">
               <thead className="bg-slate-50 border-b">
                 <tr>
-                  {['저장소','실험실','선반','물질명','CAS No.','성상','수량','단위','제조사'].map(h => (
-                    <th key={h} className="p-3 text-xs font-bold text-slate-500 uppercase tracking-wider whitespace-nowrap">{h}</th>
+                  {[
+                    {label:'저장소', key:'storage'},
+                    {label:'실험실', key:'labName'},
+                    {label:'선반',   key:'shelf'},
+                    {label:'물질명', key:'chemicalName'},
+                    {label:'CAS No.', key:null},
+                    {label:'성상',   key:'chemType'},
+                    {label:'수량',   key:null},
+                    {label:'단위',   key:null},
+                    {label:'제조사', key:null},
+                  ].map(({label, key}) => (
+                    <th key={label}
+                      className={`p-3 text-xs font-bold text-slate-500 tracking-wider whitespace-nowrap select-none ${key ? 'cursor-pointer hover:bg-slate-100 transition' : ''}`}
+                      onClick={key ? () => toggleSort(key) : undefined}>
+                      {label}{key ? sortIcon(key) : ''}
+                    </th>
                   ))}
                 </tr>
               </thead>
@@ -1896,6 +1941,20 @@ export default function App() {
     }
     setEditingRequest(null);
     showAlert("완료", "신청 내역이 수정되었습니다.");
+  };
+
+  // ── 기록 수정 ──
+  const saveEditedHistory = async (updated) => {
+    const { id, ...data } = updated;
+    if (isDemoMode) {
+      setHistory(prev => prev.map(h => h.id === id ? { ...h, ...data } : h));
+    } else {
+      try {
+        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'history', id), data);
+      } catch(e) { showAlert('오류', '기록 수정에 실패했습니다.'); return; }
+    }
+    setEditHistoryItem(null);
+    showAlert('완료', '기록이 수정되었습니다.');
   };
 
   // ── 공지사항 CRUD ──
@@ -2172,6 +2231,7 @@ export default function App() {
                     {['제1공학관', '제1과학기술관', '동물실험동'].map(s => <option key={s} value={s}>{s}</option>)}
                 </select>
                 <div className="ml-auto w-full md:w-auto">
+                    <div className="flex gap-2 flex-wrap w-full md:w-auto">
                     <button onClick={() => {
                         const csvHeader = "일자,구분,신청자,저장소,선반,실험실,물질명,CAS No.,성상,수량,제조사,서명\n";
                         const csvData = filteredHistory.map(h => {
@@ -2179,12 +2239,60 @@ export default function App() {
                             const casNo = h.cas && h.cas !== '-' ? h.cas : (chemInfo.cas || '-');
                             const chemType = h.chemType || chemInfo.type || '-';
                             const shelfInfo = h.shelf || '미지정';
-                            return `${h.actionDate},${h.type==='IN'?'반입':'반출'},${h.requestorName||'-'},${h.storage},${shelfInfo},${h.labName},${h.chemicalName},${casNo},${chemType},${h.amount}${h.unit},${h.manufacturer},${h.signature ? '[서명있음]' : '-'}`;
+                            // ="값" 형식으로 날짜 인식 방지, 쉼표 필드 안전 처리
+                            const sT = v => `="` + String(v||'-').replace(/"/g, '""') + '"';
+                            return [sT(h.actionDate), sT(h.type==='IN'?'반입':'반출'), sT(h.requestorName||'-'), sT(h.storage), sT(shelfInfo), sT(h.labName), sT(h.chemicalName), sT(casNo), sT(chemType), sT(`${h.amount}${h.unit}`), sT(h.manufacturer), sT(h.signature ? '[서명있음]' : '-')].join(',');
                         }).join("\n");
                         downloadCSV(csvHeader + csvData, "history.csv");
-                    }} className="w-full md:w-auto px-4 py-2 bg-green-600 text-white rounded font-bold flex items-center justify-center gap-2 hover:bg-green-700">
+                    }} className="flex-1 md:flex-none px-4 py-2 bg-green-600 text-white rounded font-bold flex items-center justify-center gap-2 hover:bg-green-700">
                         <Download size={16}/> CSV 다운로드
                     </button>
+                    <button onClick={() => {
+                        // 서명 이미지 포함 HTML 파일 생성 (엑셀에서도 열 수 있음)
+                        const rows = filteredHistory.map(h => {
+                            const chemInfo = chemicals.find(c => c.name === h.chemicalName) || {};
+                            const casNo = h.cas && h.cas !== '-' ? h.cas : (chemInfo.cas || '-');
+                            const chemType = h.chemType || chemInfo.type || '-';
+                            const shelfInfo = h.shelf || '미지정';
+                            const signCell = h.signature
+                                ? `<img src="${h.signature}" style="height:40px;max-width:120px;object-fit:contain;" alt="서명"/>`
+                                : '<span style="color:#aaa">없음</span>';
+                            const esc = v => String(v||'-').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                            return `<tr>
+                                <td>${esc(h.actionDate)}</td>
+                                <td>${esc(h.type==='IN'?'반입':'반출')}</td>
+                                <td>${esc(h.requestorName||'-')}</td>
+                                <td>${esc(h.storage)}</td>
+                                <td>${esc(shelfInfo)}</td>
+                                <td>${esc(h.labName)}</td>
+                                <td>${esc(h.chemicalName)}</td>
+                                <td>${esc(casNo)}</td>
+                                <td>${esc(chemType)}</td>
+                                <td>${esc(h.amount)}${esc(h.unit)}</td>
+                                <td>${esc(h.manufacturer||'-')}</td>
+                                <td>${signCell}</td>
+                            </tr>`;
+                        }).join('');
+                        const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/>
+<style>table{border-collapse:collapse;font-family:sans-serif;font-size:12px;}
+th,td{border:1px solid #ccc;padding:6px 10px;white-space:nowrap;}
+th{background:#f1f5f9;font-weight:bold;}</style></head><body>
+<h2 style="font-family:sans-serif">반출입 기록 조회 (서명 포함)</h2>
+<table><thead><tr>
+<th>처리일자</th><th>구분</th><th>신청자</th><th>저장소</th><th>선반</th>
+<th>실험실</th><th>물질명</th><th>CAS No.</th><th>성상</th>
+<th>수량</th><th>제조사</th><th>서명</th>
+</tr></thead><tbody>${rows}</tbody></table></body></html>`;
+                        const blob = new Blob([html], {type:'text/html;charset=utf-8'});
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url; a.download = 'history_서명포함.html';
+                        document.body.appendChild(a); a.click();
+                        document.body.removeChild(a); URL.revokeObjectURL(url);
+                    }} className="flex-1 md:flex-none px-4 py-2 bg-blue-600 text-white rounded font-bold flex items-center justify-center gap-2 hover:bg-blue-700">
+                        <Download size={16}/> 서명 포함 내보내기
+                    </button>
+                    </div>
                 </div>
             </div>
 
@@ -2200,6 +2308,7 @@ export default function App() {
                             <th className="p-3">수량</th>
                             <th className="p-3">제조사</th>
                             <th className="p-3 text-center">서명</th>
+                            {currentUser === 'admin' && <th className="p-3 text-center">수정</th>}
                         </tr>
                     </thead>
                     <tbody className="divide-y">
@@ -2238,6 +2347,14 @@ export default function App() {
                                         : <span className="text-slate-300 text-xs">없음</span>
                                       }
                                     </td>
+                                    {currentUser === 'admin' && (
+                                      <td className="p-3 text-center">
+                                        <button onClick={() => setEditHistoryItem({...h})}
+                                          className="inline-flex items-center gap-1 px-2 py-1 bg-amber-50 border border-amber-200 text-amber-700 rounded text-xs hover:bg-amber-100 transition">
+                                          ✏️ 수정
+                                        </button>
+                                      </td>
+                                    )}
                                 </tr>
                             );
                         })}
@@ -2256,6 +2373,71 @@ export default function App() {
                 <img src={signatureViewModal} alt="서명" className="w-full object-contain" style={{maxHeight:'200px'}} />
               </div>
               <button onClick={() => setSignatureViewModal(null)} className="mt-4 w-full py-2.5 bg-slate-800 text-white rounded-lg font-bold hover:bg-slate-900 transition">닫기</button>
+            </div>
+          </div>
+        )}
+
+        {/* 기록 수정 모달 (관리자 전용) */}
+        {editHistoryItem && (
+          <div className="fixed inset-0 bg-black/60 z-[120] flex items-center justify-center p-4" onClick={() => setEditHistoryItem(null)}>
+            <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-lg" onClick={e => e.stopPropagation()}>
+              <h3 className="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2">✏️ 반출입 기록 수정
+                <span className="text-xs font-normal text-amber-600 bg-amber-50 px-2 py-0.5 rounded border border-amber-200 ml-1">관리자 전용</span>
+              </h3>
+              <div className="grid grid-cols-2 gap-3 text-sm">
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs font-bold text-slate-500">처리일자</label>
+                  <input type="date" className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.actionDate||''} onChange={e=>setEditHistoryItem({...editHistoryItem, actionDate: e.target.value})}/>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs font-bold text-slate-500">구분</label>
+                  <select className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.type} onChange={e=>setEditHistoryItem({...editHistoryItem, type: e.target.value})}>
+                    <option value="IN">반입</option><option value="OUT">반출</option>
+                  </select>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs font-bold text-slate-500">저장소</label>
+                  <input type="text" className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.storage||''} onChange={e=>setEditHistoryItem({...editHistoryItem, storage: e.target.value})}/>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs font-bold text-slate-500">실험실</label>
+                  <input type="text" className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.labName||''} onChange={e=>setEditHistoryItem({...editHistoryItem, labName: e.target.value})}/>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs font-bold text-slate-500">선반</label>
+                  <input type="text" className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.shelf||''} onChange={e=>setEditHistoryItem({...editHistoryItem, shelf: e.target.value})} placeholder="미지정"/>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs font-bold text-slate-500">신청자</label>
+                  <input type="text" className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.requestorName||''} onChange={e=>setEditHistoryItem({...editHistoryItem, requestorName: e.target.value})}/>
+                </div>
+                <div className="flex flex-col gap-1 col-span-2">
+                  <label className="text-xs font-bold text-slate-500">물질명</label>
+                  <input type="text" className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.chemicalName||''} onChange={e=>setEditHistoryItem({...editHistoryItem, chemicalName: e.target.value})}/>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs font-bold text-slate-500">수량</label>
+                  <input type="number" className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.amount||''} onChange={e=>setEditHistoryItem({...editHistoryItem, amount: e.target.value})}/>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs font-bold text-slate-500">단위</label>
+                  <select className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.unit||'L'} onChange={e=>setEditHistoryItem({...editHistoryItem, unit: e.target.value})}>
+                    {['L','kg','mL','g','Can','Bottle'].map(u=><option key={u} value={u}>{u}</option>)}
+                  </select>
+                </div>
+                <div className="flex flex-col gap-1 col-span-2">
+                  <label className="text-xs font-bold text-slate-500">제조사</label>
+                  <select className="border p-2 rounded focus:ring-2 focus:ring-amber-400" value={editHistoryItem.manufacturer||''} onChange={e=>setEditHistoryItem({...editHistoryItem, manufacturer: e.target.value})}>
+                    <option value="">선택</option>
+                    {[...manufacturers].sort((a,b)=>a.name.localeCompare(b.name,'ko')).map((m,i)=><option key={i} value={m.name}>{m.name}</option>)}
+                  </select>
+                </div>
+              </div>
+              <p className="text-xs text-amber-600 mt-3 bg-amber-50 p-2 rounded border border-amber-100">⚠️ 수정 시 실제 재고(inventory)에는 반영되지 않으며, 기록만 변경됩니다.</p>
+              <div className="flex gap-3 mt-4">
+                <button onClick={() => setEditHistoryItem(null)} className="flex-1 py-2.5 border rounded-lg font-bold text-slate-600 hover:bg-slate-50">취소</button>
+                <button onClick={() => saveEditedHistory(editHistoryItem)} className="flex-1 py-2.5 bg-amber-500 hover:bg-amber-600 text-white rounded-lg font-bold">저장</button>
+              </div>
             </div>
           </div>
         )}

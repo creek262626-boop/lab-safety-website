@@ -49,6 +49,30 @@ const getTodayString = () => {
   return `${date.getFullYear()}-${("0" + (date.getMonth() + 1)).slice(-2)}-${("0" + date.getDate()).slice(-2)}`;
 };
 
+// ─── 사용자 화면용 병/캔 단위 변환 헬퍼 ─────────────────────────────────────
+// 단위가 'L'인 경우에만 병/캔으로 변환, 그 외는 그대로 반환
+const formatAmountForUser = (amount, unit) => {
+  if (unit !== 'L') return `${amount}${unit}`;
+  const amt = Number(amount);
+  if (!amt || amt <= 0) return `${amount}${unit}`;
+  // 18L 배수 → 캔 (예: 18L→1캔, 36L→2캔, 54L→3캔)
+  if (amt % 18 === 0) {
+    const n = amt / 18;
+    return `${n}캔(${amt}L)`;
+  }
+  // 4L 배수 → 병 (예: 4L→1병, 8L→2병, 12L→3병, 16L→4병)
+  if (amt % 4 === 0) {
+    const n = amt / 4;
+    return `${n}병(${amt}L)`;
+  }
+  // 4L 미만 소용량 → 1병으로 표시
+  if (amt < 4) {
+    return `1병(${amt}L)`;
+  }
+  // 그 외(4/18 배수 아닌 일반 수량) → L 그대로 표시
+  return `${amount}${unit}`;
+};
+
 const downloadCSV = (content, filename) => {
     const encodedUri = encodeURI("data:text/csv;charset=utf-8,\uFEFF" + content);
     const link = document.createElement("a");
@@ -1766,7 +1790,7 @@ export default function App() {
                                 <tr key={idx} className="hover:bg-blue-50 cursor-pointer" onClick={() => openShelfDetail(item)}>
                                     <td className="p-2"><div className="text-xs text-slate-500">{item.storage}</div><div className="font-bold text-blue-600">{item.shelf}</div></td>
                                     <td className="p-2 font-medium">{item.chemicalName}</td>
-                                    <td className="p-2 text-right font-bold text-blue-700">{item.amount}{item.unit} <ChevronRight size={14} className="inline text-slate-300"/></td>
+                                    <td className="p-2 text-right font-bold text-blue-700">{formatAmountForUser(item.amount, item.unit)} <ChevronRight size={14} className="inline text-slate-300"/></td>
                                 </tr>
                             ))}
                         </tbody>
@@ -1799,7 +1823,7 @@ export default function App() {
                          {Object.entries(selectedChemDetail.breakdown).map(([man, amt]) => (
                              <div key={man} className="flex justify-between items-center text-sm">
                                  <span className="text-slate-700 font-medium">{man}</span>
-                                 <span className="font-bold bg-white px-2 py-1 rounded border shadow-sm text-blue-700">{amt} {selectedChemDetail.unit}</span>
+                                 <span className="font-bold bg-white px-2 py-1 rounded border shadow-sm text-blue-700">{formatAmountForUser(amt, selectedChemDetail.unit)}</span>
                              </div>
                          ))}
                      </div>
@@ -1842,7 +1866,7 @@ export default function App() {
                                    const vb = (b[key] || '').toString();
                                    return dir * va.localeCompare(vb, 'ko', {numeric: true});
                                  }).map((item, idx) => (
-                                     <tr key={idx}><td className="p-2 font-bold text-blue-600">{item.shelf}</td><td className="p-2"><div className="font-bold">{item.chemicalName}</div><div className="text-xs text-slate-500">{item.manufacturer}</div></td><td className="p-2 text-right font-medium">{item.amount}{item.unit}</td></tr>
+                                     <tr key={idx}><td className="p-2 font-bold text-blue-600">{item.shelf}</td><td className="p-2"><div className="font-bold">{item.chemicalName}</div><div className="text-xs text-slate-500">{item.manufacturer}</div></td><td className="p-2 text-right font-medium">{formatAmountForUser(item.amount, item.unit)}</td></tr>
                                  ))}
                              </tbody>
                          </table>
@@ -1911,7 +1935,7 @@ export default function App() {
                                                                 <span className="font-bold text-slate-700 truncate">{detail.name}</span>
                                                                 <span className="text-xs text-slate-500 truncate">{detail.lab}</span>
                                                             </div>
-                                                            <span className="font-bold text-orange-600 flex-shrink-0">{detail.amount}{detail.unit}</span>
+                                                            <span className="font-bold text-orange-600 flex-shrink-0">{formatAmountForUser(detail.amount, detail.unit)}</span>
                                                         </div>
                                                     ))}
                                                 </div>
@@ -2139,7 +2163,7 @@ export default function App() {
                     <div className="text-xs text-slate-500">{req.labName}</div>
                 </td>
                 <td className="p-2 md:p-3">
-                    <div className="font-bold text-xs text-slate-800">{req.chemicalName} <span className="text-blue-600 text-xs bg-blue-50 px-1 py-0.5 rounded border border-blue-100">{req.amount}{req.unit}</span></div>
+                    <div className="font-bold text-xs text-slate-800">{req.chemicalName} <span className="text-blue-600 text-xs bg-blue-50 px-1 py-0.5 rounded border border-blue-100">{formatAmountForUser(req.amount, req.unit)}</span></div>
                     <div className="text-xs text-slate-500">{req.manufacturer}</div>
                 </td>
                 <td className="p-2 md:p-3 text-center">

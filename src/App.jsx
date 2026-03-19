@@ -49,28 +49,13 @@ const getTodayString = () => {
   return `${date.getFullYear()}-${("0" + (date.getMonth() + 1)).slice(-2)}-${("0" + date.getDate()).slice(-2)}`;
 };
 
-// ─── 사용자 화면용 병/캔 단위 변환 헬퍼 ─────────────────────────────────────
-// 단위가 'L'인 경우에만 병/캔으로 변환, 그 외는 그대로 반환
-const formatAmountForUser = (amount, unit) => {
-  if (unit !== 'L') return `${amount}${unit}`;
-  const amt = Number(amount);
-  if (!amt || amt <= 0) return `${amount}${unit}`;
-  // 18L 배수 → 캔 (예: 18L→1캔, 36L→2캔, 54L→3캔)
-  if (amt % 18 === 0) {
-    const n = amt / 18;
-    return `${n}캔(${amt}L)`;
-  }
-  // 4L 배수 → 병 (예: 4L→1병, 8L→2병, 12L→3병, 16L→4병)
-  if (amt % 4 === 0) {
-    const n = amt / 4;
-    return `${n}병(${amt}L)`;
-  }
-  // 4L 미만 소용량 → 1병으로 표시
-  if (amt < 4) {
-    return `1병(${amt}L)`;
-  }
-  // 그 외(4/18 배수 아닌 일반 수량) → L 그대로 표시
-  return `${amount}${unit}`;
+// 병/캔 단위 표시 헬퍼 (연구원용)
+const formatBottleDisplay = (amount, unit, bottleSize, bottleUnit) => {
+    if (bottleSize > 0 && bottleUnit) {
+        const count = Math.round(Number(amount) / bottleSize);
+        if (count > 0) return `${count}${bottleUnit}(${amount}L)`;
+    }
+    return `${amount}${unit || 'L'}`;
 };
 
 const downloadCSV = (content, filename) => {
@@ -358,7 +343,7 @@ export default function App() {
   const [newChemData, setNewChemData] = useState({ cas: '', name: '', type: '1석유류(비)' });
   const [newManufacturer, setNewManufacturer] = useState('');
 
-  const [requestForm, setRequestForm] = useState({ type: 'IN', labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', requestorName: '' });
+  const [requestForm, setRequestForm] = useState({ type: 'IN', labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', requestorName: '', bottleSize: 0, bottleUnit: '', bottleCount: '' });
   const [expandedStats, setExpandedStats] = useState({});
   const [isChemDropdownOpen, setIsChemDropdownOpen] = useState(false);
   const [editingRequest, setEditingRequest] = useState(null); // 승인화면 편집 모달용
@@ -379,6 +364,7 @@ export default function App() {
   const [signatureViewModal, setSignatureViewModal] = useState(null); // 서명 확인 모달 (이미지 URL)
   const [invFilter, setInvFilter] = useState({ storage: 'All', labName: 'All' }); // 재고 현황 조회 필터
   const [invSort, setInvSort] = useState({ key: 'storage', dir: 'asc' }); // 재고 현황 정렬
+  const [invEditModal, setInvEditModal] = useState(null); // 재고 병/캔 단위 편집 모달
 
   // --- 1. Firebase Setup ---
   useEffect(() => {
@@ -520,6 +506,7 @@ export default function App() {
       setSignatureViewModal(null);
       setInvFilter({ storage: 'All', labName: 'All' });
       setInvSort({ key: 'storage', dir: 'asc' });
+      setInvEditModal(null);
   };
 
   const handleAdminLogin = () => {
@@ -545,6 +532,10 @@ export default function App() {
       showAlert("안내", "서명란에 서명을 해주세요."); return;
     }
     const chem = chemicals.find(c => c.name === requestForm.chemicalName);
+    const bottleCount = requestForm.bottleSize > 0 ? Number(requestForm.bottleCount) : 0;
+    const computedAmount = requestForm.bottleSize > 0 && bottleCount > 0
+        ? String(requestForm.bottleSize * bottleCount)
+        : requestForm.amount;
     const newRequest = { 
         createdAt: Date.now(), 
         status: 'PENDING', 
@@ -554,7 +545,11 @@ export default function App() {
         cas: chem ? chem.cas : '-',
         signature: signatureData,
         requestorName: requestForm.requestorName || '서명자',
-        ...requestForm 
+        ...requestForm,
+        amount: computedAmount,
+        bottleSize: requestForm.bottleSize || 0,
+        bottleUnit: requestForm.bottleUnit || '',
+        bottleCount: requestForm.bottleSize > 0 ? String(bottleCount) : ''
     };
     
     try {
@@ -569,7 +564,7 @@ export default function App() {
             // signatureData, requestorName은 유지 (초기화하지 않음)
             showAlert("성공", "신청이 완료되었습니다. 다음 물질을 신청해주세요.");
         } else {
-            setRequestForm({ type: 'IN', labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', chemType: '', requestorName: '' });
+            setRequestForm({ type: 'IN', labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', chemType: '', requestorName: '', bottleSize: 0, bottleUnit: '', bottleCount: '' });
             setSignatureData('');
             setSignaturePadKey(k => k + 1);
             navigateTo('my_requests');
@@ -601,7 +596,8 @@ export default function App() {
                     id: Date.now(),
                     storage: req.storage, shelf: req.shelf, chemicalName: req.chemicalName, 
                     type: req.chemType, amount: targetAmount, unit: req.unit, 
-                    manufacturer: req.manufacturer, labName: req.labName, cas: req.cas || '-'
+                    manufacturer: req.manufacturer, labName: req.labName, cas: req.cas || '-',
+                    bottleSize: req.bottleSize || 0, bottleUnit: req.bottleUnit || ''
                 });
             }
         } else {
@@ -654,7 +650,8 @@ export default function App() {
                 batch.set(docRef, {
                     storage: req.storage, shelf: req.shelf, chemicalName: req.chemicalName, 
                     type: req.chemType, amount: targetAmount, unit: req.unit, 
-                    manufacturer: req.manufacturer, labName: req.labName, cas: req.cas || '-'
+                    manufacturer: req.manufacturer, labName: req.labName, cas: req.cas || '-',
+                    bottleSize: req.bottleSize || 0, bottleUnit: req.bottleUnit || ''
                 });
             }
         } else {
@@ -1007,6 +1004,77 @@ export default function App() {
     setBulkImportErrors([]);
     showAlert("완료", `${successCount}건이 신청 대기 목록에 등록되었습니다.`);
     navigateTo('my_requests');
+  };
+
+  // --- 재고 병/캔 단위 편집 저장 ---
+  const handleSaveInvBottleUnit = async () => {
+    if (!invEditModal) return;
+    const { id, bottleSize, bottleUnit } = invEditModal;
+    if (isDemoMode) {
+      setInventory(prev => prev.map(i => i.id === id ? { ...i, bottleSize: bottleSize || 0, bottleUnit: bottleUnit || '' } : i));
+      setInvEditModal(null);
+      showAlert("성공", "병/캔 단위 설정이 저장되었습니다.");
+      return;
+    }
+    try {
+      await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'inventory', id), {
+        bottleSize: bottleSize || 0,
+        bottleUnit: bottleUnit || ''
+      });
+      setInvEditModal(null);
+      showAlert("성공", "병/캔 단위 설정이 저장되었습니다.");
+    } catch(e) {
+      showAlert("오류", "저장 실패: " + e.message);
+    }
+  };
+
+  const renderInvEditModal = () => {
+    if (!invEditModal) return null;
+    return (
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 space-y-4">
+          <div className="flex items-center justify-between">
+            <h3 className="text-lg font-bold text-slate-800">병/캔 단위 설정</h3>
+            <button onClick={() => setInvEditModal(null)} className="text-slate-400 hover:text-slate-600"><X size={20}/></button>
+          </div>
+          <div className="bg-slate-50 rounded-lg p-3 text-sm text-slate-600">
+            <div className="font-bold text-slate-800">{invEditModal.chemicalName}</div>
+            <div className="text-xs text-slate-500">{invEditModal.storage} · {invEditModal.labName}</div>
+            <div className="text-xs text-slate-500 mt-1">현재 재고: <span className="font-bold text-blue-600">{invEditModal.amount}L</span></div>
+          </div>
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs font-bold text-slate-600 block mb-1.5">용기 타입 선택</label>
+              <div className="flex gap-2">
+                {[
+                  { label: '🍶 4L 병', size: 4, unit: '병' },
+                  { label: '🥫 18L 캔', size: 18, unit: '캔' },
+                  { label: '없음', size: 0, unit: '' },
+                ].map(opt => (
+                  <button
+                    key={opt.label}
+                    type="button"
+                    onClick={() => setInvEditModal({...invEditModal, bottleSize: opt.size, bottleUnit: opt.unit})}
+                    className={`flex-1 py-2 px-2 rounded-lg text-xs font-bold border-2 transition ${invEditModal.bottleSize === opt.size && invEditModal.bottleUnit === opt.unit ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-500'}`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {invEditModal.bottleSize > 0 && (
+              <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-3 text-sm text-blue-700 font-medium">
+                현재 재고: {invEditModal.amount}L ÷ {invEditModal.bottleSize}L = <span className="text-lg font-bold">{Math.round(invEditModal.amount / invEditModal.bottleSize)}{invEditModal.bottleUnit}</span>
+              </div>
+            )}
+          </div>
+          <div className="flex gap-3 pt-2">
+            <button onClick={() => setInvEditModal(null)} className="flex-1 py-2.5 rounded-xl bg-slate-100 text-slate-600 font-bold hover:bg-slate-200">취소</button>
+            <button onClick={handleSaveInvBottleUnit} className="flex-1 py-2.5 rounded-xl bg-blue-600 text-white font-bold hover:bg-blue-700 shadow">저장</button>
+          </div>
+        </div>
+      </div>
+    );
   };
 
   // --- View Components ---
@@ -1438,18 +1506,63 @@ export default function App() {
                     <button className="bg-slate-800 text-white px-4 rounded-lg hover:bg-slate-900 flex items-center gap-1" onClick={() => setIsChemDropdownOpen(!isChemDropdownOpen)} title="물질 목록 열기"><Search size={16}/></button>
                 </div>
             </div>
-            <div className="grid grid-cols-2 gap-4">
-                <div className="flex flex-col gap-2">
-                    <label className="text-sm font-bold text-slate-700">수량</label>
-                    <input type="number" className="border p-3 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none" placeholder="0.0" value={requestForm.amount} onChange={(e) => setRequestForm({...requestForm, amount: e.target.value})} />
-                </div>
-                <div className="flex flex-col gap-2">
-                    <label className="text-sm font-bold text-slate-700">단위</label>
-                    <select className="border p-3 rounded-lg bg-white focus:ring-2 focus:ring-blue-500 focus:outline-none" value={requestForm.unit} onChange={(e) => setRequestForm({...requestForm, unit: e.target.value})}>
-                        {['L', 'kg', 'mL', 'g', 'Can', 'Bottle'].map(u => <option key={u} value={u}>{u}</option>)}
-                    </select>
+            {/* 입고 형태 선택 (병/캔/직접입력) */}
+            <div className="flex flex-col gap-2">
+                <label className="text-sm font-bold text-slate-700">입고 형태</label>
+                <div className="flex gap-2 flex-wrap">
+                    {[
+                        { label: '🍶 4L 병', size: 4, unit: '병' },
+                        { label: '🥫 18L 캔', size: 18, unit: '캔' },
+                        { label: '✏️ 직접 입력', size: 0, unit: '' },
+                    ].map(opt => (
+                        <button
+                            key={opt.label}
+                            type="button"
+                            onClick={() => setRequestForm({...requestForm, bottleSize: opt.size, bottleUnit: opt.unit, bottleCount: '', amount: ''})}
+                            className={`flex-1 min-w-[100px] py-2.5 px-3 rounded-lg text-sm font-bold border-2 transition ${requestForm.bottleSize === opt.size && requestForm.bottleUnit === opt.unit ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-500 hover:border-slate-300'}`}
+                        >
+                            {opt.label}
+                        </button>
+                    ))}
                 </div>
             </div>
+
+            {/* 병/캔 수 입력 */}
+            {requestForm.bottleSize > 0 ? (
+                <div className="flex flex-col gap-2">
+                    <label className="text-sm font-bold text-slate-700">
+                        {requestForm.bottleUnit} 수 <span className="text-slate-400 font-normal text-xs">(1{requestForm.bottleUnit} = {requestForm.bottleSize}L)</span>
+                    </label>
+                    <input
+                        type="number"
+                        min="1"
+                        className="border p-3 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                        placeholder={`${requestForm.bottleUnit} 수를 입력하세요`}
+                        value={requestForm.bottleCount}
+                        onChange={(e) => setRequestForm({...requestForm, bottleCount: e.target.value, amount: String(requestForm.bottleSize * Number(e.target.value) || '')})}
+                    />
+                    {requestForm.bottleCount > 0 && (
+                        <div className="flex items-center gap-2 bg-blue-50 border border-blue-200 rounded-lg px-4 py-2.5">
+                            <span className="text-blue-600 font-bold text-sm">
+                                {requestForm.bottleSize}L × {requestForm.bottleCount}{requestForm.bottleUnit} = <span className="text-lg">{requestForm.bottleSize * Number(requestForm.bottleCount)}L</span>
+                            </span>
+                        </div>
+                    )}
+                </div>
+            ) : (
+                <div className="grid grid-cols-2 gap-4">
+                    <div className="flex flex-col gap-2">
+                        <label className="text-sm font-bold text-slate-700">수량</label>
+                        <input type="number" className="border p-3 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none" placeholder="0.0" value={requestForm.amount} onChange={(e) => setRequestForm({...requestForm, amount: e.target.value})} />
+                    </div>
+                    <div className="flex flex-col gap-2">
+                        <label className="text-sm font-bold text-slate-700">단위</label>
+                        <select className="border p-3 rounded-lg bg-white focus:ring-2 focus:ring-blue-500 focus:outline-none" value={requestForm.unit} onChange={(e) => setRequestForm({...requestForm, unit: e.target.value})}>
+                            {['L', 'kg', 'mL', 'g'].map(u => <option key={u} value={u}>{u}</option>)}
+                        </select>
+                    </div>
+                </div>
+            )}
              <div className="flex flex-col gap-2">
                 <label className="text-sm font-bold text-slate-700">제조사</label>
                 <select className="border p-3 rounded-lg bg-white focus:ring-2 focus:ring-blue-500 focus:outline-none" value={requestForm.manufacturer} onChange={(e) => setRequestForm({...requestForm, manufacturer: e.target.value})}>
@@ -1634,7 +1747,7 @@ export default function App() {
     const sortIcon = (key) => invSort.key === key ? (invSort.dir === 'asc' ? ' ▲' : ' ▼') : ' ⇅';
 
     const downloadInventoryCSV = () => {
-      const header = "저장소,실험실,선반,물질명,CAS No.,성상,수량,단위,제조사\n";
+      const header = "저장소,실험실,선반,물질명,CAS No.,성상,수량(L),단위,병/캔정보,제조사\n";
       const rows = filteredInv.map(i => {
         const chem = chemicals.find(c => c.name === i.chemicalName);
         const cas = (chem ? chem.cas : i.cas) || '-';
@@ -1642,7 +1755,8 @@ export default function App() {
         // ="값" 형식 → 엑셀 텍스트 강제, 쉼표 포함 필드도 안전
         const safeT = v => `="` + String(v||'-').replace(/"/g, '""') + '"';
         const safeN = v => String(v||'-'); // 수량은 숫자 그대로
-        return [safeT(i.storage), safeT(i.labName), safeT(i.shelf||'미지정'), safeT(i.chemicalName), safeT(cas), safeT(ct), safeN(i.amount), safeT(i.unit), safeT(i.manufacturer)].join(',');
+        const bottleInfo = (i.bottleSize > 0 && i.bottleUnit) ? `${Math.round(i.amount/i.bottleSize)}${i.bottleUnit}` : '-';
+        return [safeT(i.storage), safeT(i.labName), safeT(i.shelf||'미지정'), safeT(i.chemicalName), safeT(cas), safeT(ct), safeN(i.amount), safeT(i.unit), safeT(bottleInfo), safeT(i.manufacturer)].join(',');
       }).join("\n");
       const today = getTodayString();
       downloadCSV(header + rows, `재고현황_${today}.csv`);
@@ -1703,6 +1817,7 @@ export default function App() {
                     {label:'수량',   key:null},
                     {label:'단위',   key:null},
                     {label:'제조사', key:null},
+                    {label:'병/캔 설정', key:null},
                   ].map(({label, key}) => (
                     <th key={label}
                       className={`p-3 text-xs font-bold text-slate-500 tracking-wider whitespace-nowrap select-none ${key ? 'cursor-pointer hover:bg-slate-100 transition' : ''}`}
@@ -1729,9 +1844,21 @@ export default function App() {
                       <td className="p-3 whitespace-nowrap">
                         <span className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded font-medium">{ct}</span>
                       </td>
-                      <td className="p-3 font-bold text-right text-blue-700 whitespace-nowrap">{item.amount}</td>
+                      <td className="p-3 font-bold text-right text-blue-700 whitespace-nowrap">
+                        <div>{item.amount}L</div>
+                        {item.bottleSize > 0 && item.bottleUnit && <div className="text-xs text-slate-400 font-normal">{Math.round(item.amount/item.bottleSize)}{item.bottleUnit}</div>}
+                      </td>
                       <td className="p-3 text-slate-500 whitespace-nowrap">{item.unit}</td>
                       <td className="p-3 text-slate-600 whitespace-nowrap">{item.manufacturer || '-'}</td>
+                      <td className="p-3 text-center whitespace-nowrap">
+                        <button
+                          onClick={() => setInvEditModal({ ...item })}
+                          className="text-xs px-2 py-1 bg-amber-50 text-amber-700 border border-amber-200 rounded-lg hover:bg-amber-100 transition font-bold flex items-center gap-1 mx-auto"
+                          title="병/캔 단위 설정"
+                        >
+                          <Edit2 size={12}/> {item.bottleSize > 0 && item.bottleUnit ? `${item.bottleSize}L ${item.bottleUnit}` : '설정'}
+                        </button>
+                      </td>
                     </tr>
                   );
                 })}
@@ -1790,7 +1917,7 @@ export default function App() {
                                 <tr key={idx} className="hover:bg-blue-50 cursor-pointer" onClick={() => openShelfDetail(item)}>
                                     <td className="p-2"><div className="text-xs text-slate-500">{item.storage}</div><div className="font-bold text-blue-600">{item.shelf}</div></td>
                                     <td className="p-2 font-medium">{item.chemicalName}</td>
-                                    <td className="p-2 text-right font-bold text-blue-700">{formatAmountForUser(item.amount, item.unit)} <ChevronRight size={14} className="inline text-slate-300"/></td>
+                                    <td className="p-2 text-right font-bold text-blue-700">{formatBottleDisplay(item.amount, item.unit, item.bottleSize, item.bottleUnit)} <ChevronRight size={14} className="inline text-slate-300"/></td>
                                 </tr>
                             ))}
                         </tbody>
@@ -1823,7 +1950,7 @@ export default function App() {
                          {Object.entries(selectedChemDetail.breakdown).map(([man, amt]) => (
                              <div key={man} className="flex justify-between items-center text-sm">
                                  <span className="text-slate-700 font-medium">{man}</span>
-                                 <span className="font-bold bg-white px-2 py-1 rounded border shadow-sm text-blue-700">{formatAmountForUser(amt, selectedChemDetail.unit)}</span>
+                                 <span className="font-bold bg-white px-2 py-1 rounded border shadow-sm text-blue-700">{amt} {selectedChemDetail.unit}</span>
                              </div>
                          ))}
                      </div>
@@ -1866,7 +1993,7 @@ export default function App() {
                                    const vb = (b[key] || '').toString();
                                    return dir * va.localeCompare(vb, 'ko', {numeric: true});
                                  }).map((item, idx) => (
-                                     <tr key={idx}><td className="p-2 font-bold text-blue-600">{item.shelf}</td><td className="p-2"><div className="font-bold">{item.chemicalName}</div><div className="text-xs text-slate-500">{item.manufacturer}</div></td><td className="p-2 text-right font-medium">{formatAmountForUser(item.amount, item.unit)}</td></tr>
+                                     <tr key={idx}><td className="p-2 font-bold text-blue-600">{item.shelf}</td><td className="p-2"><div className="font-bold">{item.chemicalName}</div><div className="text-xs text-slate-500">{item.manufacturer}</div></td><td className="p-2 text-right font-medium">{formatBottleDisplay(item.amount, item.unit, item.bottleSize, item.bottleUnit)}</td></tr>
                                  ))}
                              </tbody>
                          </table>
@@ -1935,7 +2062,7 @@ export default function App() {
                                                                 <span className="font-bold text-slate-700 truncate">{detail.name}</span>
                                                                 <span className="text-xs text-slate-500 truncate">{detail.lab}</span>
                                                             </div>
-                                                            <span className="font-bold text-orange-600 flex-shrink-0">{formatAmountForUser(detail.amount, detail.unit)}</span>
+                                                            <span className="font-bold text-orange-600 flex-shrink-0">{detail.amount}{detail.unit}</span>
                                                         </div>
                                                     ))}
                                                 </div>
@@ -2044,7 +2171,7 @@ export default function App() {
                     <td className="p-2 md:p-3"><span className={`px-1.5 py-0.5 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{req.type === 'IN' ? '반입' : '반출'}</span></td>
                     <td className="p-2 md:p-3 font-medium text-slate-700 text-xs">{req.requestorName ? <span className="flex items-center gap-1">{req.signature && <span title="서명있음" className="text-green-500">✍️</span>}{req.requestorName}</span> : <span className="text-slate-300 text-xs">-</span>}</td>
                     <td className="p-2 md:p-3"><div className="font-bold text-xs">{req.storage}</div><div className="text-xs text-slate-500">{req.labName}</div></td>
-                    <td className="p-2 md:p-3"><div className="font-bold text-xs">{req.chemicalName}</div><div className="text-xs text-blue-600">{req.amount}{req.unit}</div><div className="text-xs text-slate-400">{req.manufacturer}</div></td>
+                    <td className="p-2 md:p-3"><div className="font-bold text-xs">{req.chemicalName}</div><div className="text-xs text-blue-600">{req.bottleSize > 0 && req.bottleUnit ? `${req.bottleCount}${req.bottleUnit}(${req.amount}L)` : `${req.amount}${req.unit}`}</div><div className="text-xs text-slate-400">{req.manufacturer}</div></td>
 
                     <td className="p-2 md:p-3">
                       {req.status === 'PENDING' && <span className="px-1.5 py-0.5 bg-yellow-100 text-yellow-700 rounded text-xs font-bold">대기중</span>}
@@ -2163,7 +2290,7 @@ export default function App() {
                     <div className="text-xs text-slate-500">{req.labName}</div>
                 </td>
                 <td className="p-2 md:p-3">
-                    <div className="font-bold text-xs text-slate-800">{req.chemicalName} <span className="text-blue-600 text-xs bg-blue-50 px-1 py-0.5 rounded border border-blue-100">{formatAmountForUser(req.amount, req.unit)}</span></div>
+                    <div className="font-bold text-xs text-slate-800">{req.chemicalName} <span className="text-blue-600 text-xs bg-blue-50 px-1 py-0.5 rounded border border-blue-100">{req.bottleSize > 0 && req.bottleUnit ? `${req.bottleCount}${req.bottleUnit}(${req.amount}L)` : `${req.amount}${req.unit}`}</span></div>
                     <div className="text-xs text-slate-500">{req.manufacturer}</div>
                 </td>
                 <td className="p-2 md:p-3 text-center">
@@ -2584,7 +2711,8 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
   return (
     <div className="flex h-screen bg-slate-50 font-sans text-slate-800">
       {renderModal()}
-      {renderBulkImportModal()}{/* ✅ 로그인 후에도 엑셀 모달이 표시되도록 최상위에 배치 */}
+      {renderBulkImportModal()}
+      {renderInvEditModal()}{/* ✅ 로그인 후에도 엑셀 모달이 표시되도록 최상위에 배치 */}
       {!currentUser ? renderLoginScreen() : (
           <>
              {renderSidebar()}

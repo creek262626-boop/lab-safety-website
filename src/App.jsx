@@ -50,10 +50,15 @@ const getTodayString = () => {
 };
 
 // 병/캔 단위 표시 헬퍼 (연구원용)
-const formatBottleDisplay = (amount, unit, bottleSize, bottleUnit) => {
+const formatBottleDisplay = (amount, unit, bottleSize, bottleUnit, bottleCount, isAdmin = false) => {
+    // 관리자는 항상 리터/원본 단위로 표시
+    if (isAdmin) return `${amount}${unit || 'L'}`;
+    // 병/캔 정보가 있을 때 연구자용 표시
     if (bottleSize > 0 && bottleUnit) {
-        const count = Math.round(Number(amount) / bottleSize);
-        if (count > 0) return `${count}${bottleUnit}(${amount}L)`;
+        const cnt = (bottleCount && Number(bottleCount) > 0)
+            ? Number(bottleCount)
+            : Math.round(Number(amount) / bottleSize);
+        if (cnt > 0) return `${cnt}${bottleUnit}(${amount}${unit && unit !== 'L' ? unit : 'L'})`;
     }
     return `${amount}${unit || 'L'}`;
 };
@@ -532,10 +537,21 @@ export default function App() {
       showAlert("안내", "서명란에 서명을 해주세요."); return;
     }
     const chem = chemicals.find(c => c.name === requestForm.chemicalName);
-    const bottleCount = requestForm.bottleSize > 0 ? Number(requestForm.bottleCount) : 0;
-    const computedAmount = requestForm.bottleSize > 0 && bottleCount > 0
-        ? String(requestForm.bottleSize * bottleCount)
-        : requestForm.amount;
+    // 프리셋(4L병/18L캔) 처리
+    const presetCnt = requestForm.bottleSize > 0 ? Number(requestForm.bottleCount) : 0;
+    const presetAmt = requestForm.bottleSize > 0 && presetCnt > 0
+        ? String(requestForm.bottleSize * presetCnt) : null;
+    // 직접입력(수량×갯수) 처리
+    const directSz  = Number(requestForm.directSize) || 0;
+    const directCnt = Number(requestForm.directCount) || 0;
+    const directAmt = directSz > 0 && directCnt > 0 ? String(directSz * directCnt) : null;
+    // 최종값 결정
+    const finalAmt       = presetAmt || directAmt || requestForm.amount;
+    const finalBotSz     = requestForm.bottleSize > 0 ? requestForm.bottleSize : directSz;
+    const finalBotUnit   = requestForm.bottleSize > 0 ? requestForm.bottleUnit
+                           : (directSz > 0 ? (requestForm.directUnit || '병') : '');
+    const finalBotCount  = requestForm.bottleSize > 0 ? String(presetCnt)
+                           : (directCnt > 0 ? String(directCnt) : '');
     const newRequest = { 
         createdAt: Date.now(), 
         status: 'PENDING', 
@@ -546,10 +562,10 @@ export default function App() {
         signature: signatureData,
         requestorName: requestForm.requestorName || '서명자',
         ...requestForm,
-        amount: computedAmount,
-        bottleSize: requestForm.bottleSize || 0,
-        bottleUnit: requestForm.bottleUnit || '',
-        bottleCount: requestForm.bottleSize > 0 ? String(bottleCount) : ''
+        amount: finalAmt,
+        bottleSize: finalBotSz,
+        bottleUnit: finalBotUnit,
+        bottleCount: finalBotCount
     };
     
     try {
@@ -564,7 +580,7 @@ export default function App() {
             // signatureData, requestorName은 유지 (초기화하지 않음)
             showAlert("성공", "신청이 완료되었습니다. 다음 물질을 신청해주세요.");
         } else {
-            setRequestForm({ type: 'IN', labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', chemType: '', requestorName: '', bottleSize: 0, bottleUnit: '', bottleCount: '' });
+            setRequestForm({ type: 'IN', labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', chemType: '', requestorName: '', bottleSize: 0, bottleUnit: '', bottleCount: '', directSize: '', directUnit: '병', directCount: '' });
             setSignatureData('');
             setSignaturePadKey(k => k + 1);
             navigateTo('my_requests');
@@ -651,7 +667,8 @@ export default function App() {
                     storage: req.storage, shelf: req.shelf, chemicalName: req.chemicalName, 
                     type: req.chemType, amount: targetAmount, unit: req.unit, 
                     manufacturer: req.manufacturer, labName: req.labName, cas: req.cas || '-',
-                    bottleSize: req.bottleSize || 0, bottleUnit: req.bottleUnit || ''
+                    bottleSize: req.bottleSize || 0, bottleUnit: req.bottleUnit || '',
+                    bottleCount: req.bottleCount || ''
                 });
             }
         } else {
@@ -913,14 +930,31 @@ export default function App() {
 
       rows.forEach((parts, idx) => {
         const rowNum = idx + 2;
-        const type = String(parts[0] || '').trim().toUpperCase();
-        const storage = String(parts[1] || '').trim();
-        const labName = String(parts[2] || '').trim();
+        const type         = String(parts[0] || '').trim().toUpperCase();
+        const storage      = String(parts[1] || '').trim();
+        const labName      = String(parts[2] || '').trim();
         const chemicalName = String(parts[3] || '').trim();
-        const amount = parseFloat(String(parts[4] || '').trim());
-        const unit = String(parts[5] || 'L').trim();
-        const manufacturer = String(parts[6] || '').trim();
-        const requestorName = String(parts[7] || '').trim();
+        const amount       = parseFloat(String(parts[4] || '').trim());
+        const unit         = String(parts[5] || 'L').trim();
+        // 새 컬럼: 병수(6), 병단위(7) → 기존 파일 호환(6=제조사, 7=신청자)
+        const col6         = String(parts[6] || '').trim();
+        const col7         = String(parts[7] || '').trim();
+        const col8         = String(parts[8] || '').trim();
+        const col9         = String(parts[9] || '').trim();
+        // 병수/병단위 자동 감지
+        const BOTTLE_UNITS = ['병','캔','개','팩','박스'];
+        let bottleCount = 0, bottleUnit = '', manufacturer = '', requestorName = '';
+        if (parts.length >= 10) {
+          // 10컬럼 이상: 유형,저장소,실험실명,물질명,수량,단위,병수,병단위,제조사,신청자
+          bottleCount   = isNaN(Number(col6)) ? 0 : Number(col6);
+          bottleUnit    = BOTTLE_UNITS.includes(col7) ? col7 : '';
+          manufacturer  = col8;
+          requestorName = col9;
+        } else {
+          // 8컬럼 구형: 유형,저장소,실험실명,물질명,수량,단위,제조사,신청자
+          manufacturer  = col6;
+          requestorName = col7;
+        }
 
         const rowErrors = [];
         if (!['IN','OUT'].includes(type)) rowErrors.push(`유형(IN/OUT) 오류`);
@@ -928,30 +962,27 @@ export default function App() {
         if (!labName) rowErrors.push(`실험실명 누락`);
         if (!chemicalName) rowErrors.push(`물질명 누락`);
         if (isNaN(amount) || amount <= 0) rowErrors.push(`수량 오류: "${parts[4]}"`);
-        if (!UNITS.includes(unit)) rowErrors.push(`단위 오류(${UNITS.join('/')})`);
+        if (!UNITS.includes(unit) && !['L','mL','kg','g'].includes(unit)) rowErrors.push(`단위 오류(${UNITS.join('/')})`);
         if (!requestorName) rowErrors.push(`신청자 성명 누락`);
 
         const chem = chemicals.find(c => c.name === chemicalName);
         const lab = labs.find(l => l.name === labName);
         const ext = lab ? lab.ext : '';
+        const calcBottleSize = bottleCount > 0 && amount > 0 ? amount / bottleCount : 0;
 
         if (rowErrors.length > 0) {
           errors.push({ rowNum, errors: rowErrors, data: parts });
         } else {
           parsed.push({
-            _rowNum: rowNum,
-            _valid: true,
-            type: type,
-            storage,
-            labName,
-            ext,
-            chemicalName,
+            _rowNum: rowNum, _valid: true,
+            type, storage, labName, ext, chemicalName,
             chemType: chem ? chem.type : '미지정',
             cas: chem ? chem.cas : '-',
-            amount: String(amount),
-            unit,
-            manufacturer,
-            requestorName,
+            amount: String(amount), unit,
+            bottleCount: bottleCount > 0 ? String(bottleCount) : '',
+            bottleUnit: bottleUnit,
+            bottleSize: calcBottleSize,
+            manufacturer, requestorName,
             shelf: '미지정',
           });
         }
@@ -984,9 +1015,13 @@ export default function App() {
         cas: row.cas,
         amount: row.amount,
         unit: row.unit,
+        bottleSize: row.bottleSize || 0,
+        bottleUnit: row.bottleUnit || '',
+        bottleCount: row.bottleCount || '',
         manufacturer: row.manufacturer,
         requestorName: row.requestorName,
         shelf: row.shelf,
+        signature: '',
       };
       try {
         if (isDemoMode) {
@@ -1045,22 +1080,62 @@ export default function App() {
           <div className="space-y-3">
             <div>
               <label className="text-xs font-bold text-slate-600 block mb-1.5">용기 타입 선택</label>
-              <div className="flex gap-2">
+              <div className="flex gap-2 flex-wrap">
                 {[
-                  { label: '🍶 4L 병', size: 4, unit: '병' },
-                  { label: '🥫 18L 캔', size: 18, unit: '캔' },
-                  { label: '없음', size: 0, unit: '' },
+                  { label: '🍶 4L 병', size: 4, unit: '병', custom: false },
+                  { label: '🥫 18L 캔', size: 18, unit: '캔', custom: false },
+                  { label: '✏️ 직접', size: -1, unit: '', custom: true },
+                  { label: '없음', size: 0, unit: '', custom: false },
                 ].map(opt => (
                   <button
                     key={opt.label}
                     type="button"
-                    onClick={() => setInvEditModal({...invEditModal, bottleSize: opt.size, bottleUnit: opt.unit})}
-                    className={`flex-1 py-2 px-2 rounded-lg text-xs font-bold border-2 transition ${invEditModal.bottleSize === opt.size && invEditModal.bottleUnit === opt.unit ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-500'}`}
+                    onClick={() => {
+                      if (opt.custom) {
+                        setInvEditModal({...invEditModal, isCustom: true,
+                          bottleSize: Number(invEditModal.customSize)||0,
+                          bottleUnit: invEditModal.customUnit||'병'});
+                      } else {
+                        setInvEditModal({...invEditModal, isCustom: false,
+                          bottleSize: opt.size, bottleUnit: opt.unit});
+                      }
+                    }}
+                    className={`flex-1 min-w-[60px] py-2 px-2 rounded-lg text-xs font-bold border-2 transition ${
+                      opt.custom
+                        ? (invEditModal.isCustom ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-500')
+                        : (!invEditModal.isCustom && invEditModal.bottleSize === opt.size && invEditModal.bottleUnit === opt.unit ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-500')
+                    }`}
                   >
                     {opt.label}
                   </button>
                 ))}
               </div>
+              {/* 직접입력 시 용량/단위 입력 */}
+              {invEditModal.isCustom && (
+                <div className="flex gap-2 mt-2">
+                  <div className="flex-1">
+                    <label className="text-xs text-slate-500 block mb-1">1개당 용량</label>
+                    <input type="number" min="0.1" step="0.1"
+                      className="w-full border p-2 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                      placeholder="예: 2.5"
+                      value={invEditModal.customSize || ''}
+                      onChange={e => setInvEditModal({...invEditModal,
+                        customSize: e.target.value,
+                        bottleSize: Number(e.target.value) || 0})}
+                    />
+                  </div>
+                  <div className="flex-1">
+                    <label className="text-xs text-slate-500 block mb-1">단위</label>
+                    <select className="w-full border p-2 rounded-lg text-sm bg-white focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                      value={invEditModal.customUnit || '병'}
+                      onChange={e => setInvEditModal({...invEditModal,
+                        customUnit: e.target.value, bottleUnit: e.target.value})}
+                    >
+                      {['병','캔','개','팩','박스'].map(u => <option key={u}>{u}</option>)}
+                    </select>
+                  </div>
+                </div>
+              )}
             </div>
             {invEditModal.bottleSize > 0 && (
               <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-3 text-sm text-blue-700 font-medium">
@@ -1098,7 +1173,7 @@ export default function App() {
 
   const renderBulkImportModal = () => {
     if (!bulkImportModal) return null;
-    const SAMPLE_URL = "data:text/csv;charset=utf-8,\uFEFF유형(IN/OUT),저장소,실험실명,물질명,수량,단위(L/kg/mL/g/Can/Bottle),제조사,신청자성명\nIN,제1공학관,연구실A,Acetone,5,L,삼전순약공업,홍길동\nOUT,제1공학관,연구실A,Acetone,2,L,,홍길동";
+    const SAMPLE_URL = "data:text/csv;charset=utf-8,\uFEFF유형(IN/OUT),저장소,실험실명,물질명,수량(L),단위,병수,병단위,제조사,신청자성명\nIN,제1공학관,연구실A,Acetone,20,L,5,병,삼전순약공업,홍길동\nIN,제1공학관,연구실A,Methanol,18,L,1,캔,삼전순약공업,홍길동\nOUT,제1공학관,연구실A,Acetone,4,L,1,병,,홍길동\nIN,제1공학관,연구실B,에탄올,2.5,L,1,병,,김연구";
     return (
       <div className="fixed inset-0 bg-black/70 z-[200] flex items-center justify-center p-2 md:p-4">
         <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[95vh] flex flex-col">
@@ -1127,7 +1202,7 @@ export default function App() {
                 <Download size={16}/> 양식 다운로드
               </a>
               <div className="text-xs text-slate-500 bg-slate-50 border rounded-lg p-2 flex-1 min-w-[200px]">
-                <strong>컬럼 순서:</strong> 유형(IN/OUT) | 저장소 | 실험실명 | 물질명 | 수량 | 단위 | 제조사 | 신청자성명
+                <strong>컬럼 순서:</strong> 유형(IN/OUT) | 저장소 | 실험실명 | 물질명 | 수량(L) | 단위 | 병수 | 병단위 | 제조사 | 신청자성명
               </div>
             </div>
 
@@ -1156,7 +1231,7 @@ export default function App() {
                   <table className="w-full text-xs">
                     <thead className="bg-slate-100 sticky top-0">
                       <tr>
-                        {['#','유형','저장소','실험실','물질명','수량','단위','제조사','신청자'].map(h => (
+                        {['#','유형','저장소','실험실','물질명','수량','단위','병/캔','제조사','신청자'].map(h => (
                           <th key={h} className="p-2 text-left font-bold text-slate-600 whitespace-nowrap">{h}</th>
                         ))}
                         <th className="p-2">제거</th>
@@ -1172,6 +1247,7 @@ export default function App() {
                           <td className="p-2 font-bold whitespace-nowrap">{row.chemicalName}</td>
                           <td className="p-2 text-right">{row.amount}</td>
                           <td className="p-2">{row.unit}</td>
+                          <td className="p-2 whitespace-nowrap text-xs text-blue-600">{row.bottleCount ? `${row.bottleCount}${row.bottleUnit}` : '-'}</td>
                           <td className="p-2">{row.manufacturer || '-'}</td>
                           <td className="p-2">{row.requestorName}</td>
                           <td className="p-2 text-center">
@@ -1518,7 +1594,7 @@ export default function App() {
                         <button
                             key={opt.label}
                             type="button"
-                            onClick={() => setRequestForm({...requestForm, bottleSize: opt.size, bottleUnit: opt.unit, bottleCount: '', amount: ''})}
+                            onClick={() => setRequestForm({...requestForm, bottleSize: opt.size, bottleUnit: opt.unit, bottleCount: '', amount: '', directSize: '', directCount: ''})}
                             className={`flex-1 min-w-[100px] py-2.5 px-3 rounded-lg text-sm font-bold border-2 transition ${requestForm.bottleSize === opt.size && requestForm.bottleUnit === opt.unit ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-500 hover:border-slate-300'}`}
                         >
                             {opt.label}
@@ -1550,16 +1626,75 @@ export default function App() {
                     )}
                 </div>
             ) : (
-                <div className="grid grid-cols-2 gap-4">
-                    <div className="flex flex-col gap-2">
-                        <label className="text-sm font-bold text-slate-700">수량</label>
-                        <input type="number" className="border p-3 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none" placeholder="0.0" value={requestForm.amount} onChange={(e) => setRequestForm({...requestForm, amount: e.target.value})} />
+                /* ✏️ 직접 입력: 수량 × 갯수 형식 */
+                <div className="flex flex-col gap-3">
+                    <div className="grid grid-cols-[1fr_24px_1fr] items-end gap-2">
+                        {/* 좌: 1개당 용량 */}
+                        <div className="flex flex-col gap-1">
+                            <label className="text-xs font-bold text-slate-600">1개당 용량</label>
+                            <div className="flex gap-1">
+                                <input
+                                    type="number" min="0" step="0.1"
+                                    className="border p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none w-full min-w-0"
+                                    placeholder="2.5"
+                                    value={requestForm.directSize}
+                                    onChange={e => {
+                                        const sz = e.target.value;
+                                        const cnt = Number(requestForm.directCount) || 0;
+                                        setRequestForm({...requestForm, directSize: sz,
+                                            amount: sz && cnt > 0 ? String(Number(sz) * cnt) : ''});
+                                    }}
+                                />
+                                <select className="border p-2.5 rounded-lg bg-white focus:ring-2 focus:ring-blue-500 w-16 focus:outline-none flex-shrink-0"
+                                    value={requestForm.unit}
+                                    onChange={e => setRequestForm({...requestForm, unit: e.target.value})}>
+                                    {['L','mL','kg','g'].map(u => <option key={u}>{u}</option>)}
+                                </select>
+                            </div>
+                        </div>
+                        {/* 중: × */}
+                        <div className="text-lg font-bold text-slate-400 text-center pb-2">×</div>
+                        {/* 우: 갯수 */}
+                        <div className="flex flex-col gap-1">
+                            <label className="text-xs font-bold text-slate-600">갯수</label>
+                            <div className="flex gap-1">
+                                <input
+                                    type="number" min="1"
+                                    className="border p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none w-full min-w-0"
+                                    placeholder="1"
+                                    value={requestForm.directCount}
+                                    onChange={e => {
+                                        const cnt = e.target.value;
+                                        const sz = Number(requestForm.directSize) || 0;
+                                        setRequestForm({...requestForm, directCount: cnt,
+                                            amount: cnt && sz > 0 ? String(sz * Number(cnt)) : ''});
+                                    }}
+                                />
+                                <select className="border p-2.5 rounded-lg bg-white focus:ring-2 focus:ring-blue-500 w-16 focus:outline-none flex-shrink-0"
+                                    value={requestForm.directUnit}
+                                    onChange={e => setRequestForm({...requestForm, directUnit: e.target.value})}>
+                                    {['병','캔','개','팩','박스'].map(u => <option key={u}>{u}</option>)}
+                                </select>
+                            </div>
+                        </div>
                     </div>
-                    <div className="flex flex-col gap-2">
-                        <label className="text-sm font-bold text-slate-700">단위</label>
-                        <select className="border p-3 rounded-lg bg-white focus:ring-2 focus:ring-blue-500 focus:outline-none" value={requestForm.unit} onChange={(e) => setRequestForm({...requestForm, unit: e.target.value})}>
-                            {['L', 'kg', 'mL', 'g'].map(u => <option key={u} value={u}>{u}</option>)}
-                        </select>
+                    {/* 계산 미리보기 */}
+                    {Number(requestForm.directSize) > 0 && Number(requestForm.directCount) > 0 && (
+                        <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-2.5 flex flex-wrap items-center gap-2">
+                            <span className="text-blue-700 font-bold text-sm">
+                                {requestForm.directSize}{requestForm.unit} × {requestForm.directCount}{requestForm.directUnit} = {Number(requestForm.directSize) * Number(requestForm.directCount)}{requestForm.unit}
+                            </span>
+                            <span className="text-xs text-blue-400">→ 연구자 화면: <b>{requestForm.directCount}{requestForm.directUnit}({Number(requestForm.directSize)*Number(requestForm.directCount)}{requestForm.unit})</b></span>
+                        </div>
+                    )}
+                    {/* 총량 수동 입력 */}
+                    <div className="flex flex-col gap-1">
+                        <label className="text-xs font-bold text-slate-600">총량 <span className="text-slate-400 font-normal">(위에서 자동계산 또는 직접 입력)</span></label>
+                        <input type="number"
+                            className="border p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                            placeholder="총량"
+                            value={requestForm.amount}
+                            onChange={e => setRequestForm({...requestForm, amount: e.target.value})} />
                     </div>
                 </div>
             )}
@@ -1755,7 +1890,8 @@ export default function App() {
         // ="값" 형식 → 엑셀 텍스트 강제, 쉼표 포함 필드도 안전
         const safeT = v => `="` + String(v||'-').replace(/"/g, '""') + '"';
         const safeN = v => String(v||'-'); // 수량은 숫자 그대로
-        const bottleInfo = (i.bottleSize > 0 && i.bottleUnit) ? `${Math.round(i.amount/i.bottleSize)}${i.bottleUnit}` : '-';
+        const bottleInfo = (i.bottleSize > 0 && i.bottleUnit && Number(i.amount) > 0)
+          ? `${i.bottleCount && Number(i.bottleCount)>0 ? Number(i.bottleCount) : Math.round(Number(i.amount)/i.bottleSize)}${i.bottleUnit}(${i.amount}L)` : '-';
         return [safeT(i.storage), safeT(i.labName), safeT(i.shelf||'미지정'), safeT(i.chemicalName), safeT(cas), safeT(ct), safeN(i.amount), safeT(i.unit), safeT(bottleInfo), safeT(i.manufacturer)].join(',');
       }).join("\n");
       const today = getTodayString();
@@ -1917,7 +2053,7 @@ export default function App() {
                                 <tr key={idx} className="hover:bg-blue-50 cursor-pointer" onClick={() => openShelfDetail(item)}>
                                     <td className="p-2"><div className="text-xs text-slate-500">{item.storage}</div><div className="font-bold text-blue-600">{item.shelf}</div></td>
                                     <td className="p-2 font-medium">{item.chemicalName}</td>
-                                    <td className="p-2 text-right font-bold text-blue-700">{formatBottleDisplay(item.amount, item.unit, item.bottleSize, item.bottleUnit)} <ChevronRight size={14} className="inline text-slate-300"/></td>
+                                    <td className="p-2 text-right font-bold text-blue-700">{formatBottleDisplay(item.amount, item.unit, item.bottleSize, item.bottleUnit, item.bottleCount)} <ChevronRight size={14} className="inline text-slate-300"/></td>
                                 </tr>
                             ))}
                         </tbody>
@@ -1962,41 +2098,58 @@ export default function App() {
              <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={() => setSelectedLabDetail(null)}>
                  <div className="bg-white p-4 md:p-6 rounded-xl shadow-xl w-full max-w-2xl max-h-[80vh] flex flex-col" onClick={e => e.stopPropagation()}>
                      <h3 className="text-lg md:text-xl font-bold text-slate-800 border-b pb-3">{selectedLabDetail.labName} 보유품목</h3>
-                     <div className="mt-4 flex-1 overflow-x-auto overflow-y-auto">
-                         <table className="w-full text-sm text-left min-w-[400px] whitespace-nowrap">
-                             <thead className="bg-slate-50 sticky top-0">
-                               <tr>
-                                 <th className="p-2 cursor-pointer select-none hover:bg-slate-100 transition"
-                                   onClick={() => setSelectedLabDetail(prev => ({
-                                     ...prev,
-                                     sortKey: 'shelf',
-                                     sortDir: prev.sortKey === 'shelf' ? (prev.sortDir === 'asc' ? 'desc' : 'asc') : 'asc'
-                                   }))}>
-                                   선반 {selectedLabDetail.sortKey === 'shelf' ? (selectedLabDetail.sortDir === 'asc' ? '▲' : '▼') : '⇅'}
-                                 </th>
-                                 <th className="p-2 cursor-pointer select-none hover:bg-slate-100 transition"
-                                   onClick={() => setSelectedLabDetail(prev => ({
-                                     ...prev,
-                                     sortKey: 'chemicalName',
-                                     sortDir: prev.sortKey === 'chemicalName' ? (prev.sortDir === 'asc' ? 'desc' : 'asc') : 'asc'
-                                   }))}>
-                                   물질명/제조사 {selectedLabDetail.sortKey === 'chemicalName' ? (selectedLabDetail.sortDir === 'asc' ? '▲' : '▼') : '⇅'}
-                                 </th>
-                                 <th className="p-2 text-right">수량</th>
-                               </tr>
-                             </thead>
-                             <tbody className="divide-y">
-                                 {[...selectedLabDetail.items].sort((a, b) => {
-                                   const key = selectedLabDetail.sortKey || 'shelf';
-                                   const dir = selectedLabDetail.sortDir === 'desc' ? -1 : 1;
-                                   const va = (a[key] || '').toString();
-                                   const vb = (b[key] || '').toString();
-                                   return dir * va.localeCompare(vb, 'ko', {numeric: true});
-                                 }).map((item, idx) => (
-                                     <tr key={idx}><td className="p-2 font-bold text-blue-600">{item.shelf}</td><td className="p-2"><div className="font-bold">{item.chemicalName}</div><div className="text-xs text-slate-500">{item.manufacturer}</div></td><td className="p-2 text-right font-medium">{formatBottleDisplay(item.amount, item.unit, item.bottleSize, item.bottleUnit)}</td></tr>
-                                 ))}
-                             </tbody>
-                         </table>
+                     {/* 정렬 버튼 */}
+                     <div className="flex gap-2 mt-2 mb-1 px-1">
+                       <button onClick={() => setSelectedLabDetail(prev => ({...prev, sortKey: 'shelf', sortDir: prev.sortKey==='shelf'?(prev.sortDir==='asc'?'desc':'asc'):'asc'}))}
+                         className={`text-xs px-2 py-1 rounded border ${selectedLabDetail.sortKey==='shelf'?'bg-blue-50 border-blue-300 text-blue-700 font-bold':'border-slate-200 text-slate-500'}`}>
+                         선반 {selectedLabDetail.sortKey==='shelf'?(selectedLabDetail.sortDir==='asc'?'▲':'▼'):'⇅'}
+                       </button>
+                       <button onClick={() => setSelectedLabDetail(prev => ({...prev, sortKey: 'chemicalName', sortDir: prev.sortKey==='chemicalName'?(prev.sortDir==='asc'?'desc':'asc'):'asc'}))}
+                         className={`text-xs px-2 py-1 rounded border ${selectedLabDetail.sortKey==='chemicalName'?'bg-blue-50 border-blue-300 text-blue-700 font-bold':'border-slate-200 text-slate-500'}`}>
+                         물질명 {selectedLabDetail.sortKey==='chemicalName'?(selectedLabDetail.sortDir==='asc'?'▲':'▼'):'⇅'}
+                       </button>
+                     </div>
+                     <div className="flex-1 overflow-y-auto mt-1">
+                       {/* 데스크톱: 테이블 */}
+                       <table className="w-full text-sm text-left hidden md:table">
+                         <thead className="bg-slate-50 sticky top-0 border-b">
+                           <tr>
+                             <th className="p-2 w-16 whitespace-nowrap text-slate-600">선반</th>
+                             <th className="p-2 text-slate-600">물질명 / 제조사</th>
+                             <th className="p-2 text-right whitespace-nowrap text-slate-600">수량</th>
+                           </tr>
+                         </thead>
+                         <tbody className="divide-y">
+                           {[...selectedLabDetail.items].sort((a,b)=>{
+                             const k=selectedLabDetail.sortKey||'shelf', d=selectedLabDetail.sortDir==='desc'?-1:1;
+                             return d*(a[k]||'').toString().localeCompare((b[k]||'').toString(),'ko',{numeric:true});
+                           }).map((item,i)=>(
+                             <tr key={i} className="hover:bg-slate-50">
+                               <td className="p-2 font-bold text-blue-600 whitespace-nowrap">{item.shelf}</td>
+                               <td className="p-2"><div className="font-bold">{item.chemicalName}</div><div className="text-xs text-slate-500">{item.manufacturer}</div></td>
+                               <td className="p-2 text-right font-medium whitespace-nowrap">{formatBottleDisplay(item.amount, item.unit, item.bottleSize, item.bottleUnit, item.bottleCount)}</td>
+                             </tr>
+                           ))}
+                         </tbody>
+                       </table>
+                       {/* 모바일: 카드 */}
+                       <div className="md:hidden space-y-2 pb-2">
+                         {[...selectedLabDetail.items].sort((a,b)=>{
+                           const k=selectedLabDetail.sortKey||'shelf', d=selectedLabDetail.sortDir==='desc'?-1:1;
+                           return d*(a[k]||'').toString().localeCompare((b[k]||'').toString(),'ko',{numeric:true});
+                         }).map((item,i)=>(
+                           <div key={i} className="flex items-center justify-between gap-2 bg-white border border-slate-200 rounded-lg p-2.5">
+                             <div className="flex items-center gap-2 flex-1 min-w-0">
+                               <span className="text-xs font-bold text-blue-600 bg-blue-50 px-2 py-0.5 rounded whitespace-nowrap shrink-0">{item.shelf}</span>
+                               <div className="min-w-0">
+                                 <div className="font-bold text-sm truncate">{item.chemicalName}</div>
+                                 <div className="text-xs text-slate-400 truncate">{item.manufacturer}</div>
+                               </div>
+                             </div>
+                             <div className="font-bold text-blue-700 whitespace-nowrap text-sm shrink-0">{formatBottleDisplay(item.amount, item.unit, item.bottleSize, item.bottleUnit, item.bottleCount)}</div>
+                           </div>
+                         ))}
+                       </div>
                      </div>
                      <button onClick={() => setSelectedLabDetail(null)} className="mt-4 w-full py-3 bg-slate-800 text-white rounded-lg font-bold">닫기</button>
                  </div>

@@ -65,6 +65,16 @@ const maskRequestorName = (name) => {
     return `${safe[0]}${'*'.repeat(Math.max(safe.length - 1, 1))}`;
 };
 
+const QUICK_CHEMICAL_BUTTONS = [
+    { label: 'Acetone (아세톤)', names: ['Acetone', '아세톤'] },
+    { label: 'Acetonitrile (아세토니트릴)', names: ['Acetonitrile', '아세토니트릴'] },
+    { label: 'Ethanol (에탄올)', names: ['Ethanol', '에탄올'] },
+    { label: 'Ethyl Acetate (에틸아세테이트)', names: ['Ethyl Acetate', '에틸아세테이트'] },
+    { label: 'Isopropyl alcohol (이소프로필알코올)', names: ['Isopropyl alcohol', '이소프로필알코올', 'IPA'] },
+    { label: 'Methanol (메탄올)', names: ['Methanol', '메탄올'] },
+    { label: 'n-Hexane (노말헥산)', names: ['n-Hexane', '노말헥산', 'Hexane'] },
+];
+
 // 병/캔 단위 표시 헬퍼 (연구원용)
 const formatBottleDisplay = (amount, unit, bottleSize, bottleUnit, bottleCount, isAdmin = false) => {
     // 관리자는 항상 리터/원본 단위로 표시
@@ -350,6 +360,7 @@ export default function App() {
   const [privacyConsentAt, setPrivacyConsentAt] = useState('');
   const [deleteNameModal, setDeleteNameModal] = useState(null);
   const [deleteNameInput, setDeleteNameInput] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const [labs, setLabs] = useState([]);
   const [chemicals, setChemicals] = useState([]);
@@ -369,7 +380,7 @@ export default function App() {
   const [newChemData, setNewChemData] = useState({ cas: '', name: '', type: '1석유류(비)' });
   const [newManufacturer, setNewManufacturer] = useState('');
 
-  const [requestForm, setRequestForm] = useState({ type: 'IN', labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', requestorName: '', bottleSize: 0, bottleUnit: '', bottleCount: '', directSize: '', directUnit: '병', directCount: '' });
+  const [requestForm, setRequestForm] = useState({ type: 'IN', actionDate: getTodayString(), labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', requestorName: '', bottleSize: 0, bottleUnit: '', bottleCount: '', directSize: '', directUnit: '병', directCount: '' });
   const [expandedStats, setExpandedStats] = useState({});
   const [isChemDropdownOpen, setIsChemDropdownOpen] = useState(false);
   const [editingRequest, setEditingRequest] = useState(null); // 승인화면 편집 모달용
@@ -538,6 +549,8 @@ export default function App() {
       setPrivacyConsentAt('');
       setDeleteNameModal(null);
       setDeleteNameInput('');
+      setIsSubmitting(false);
+      setRequestForm({ type: 'IN', actionDate: getTodayString(), labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', requestorName: '', bottleSize: 0, bottleUnit: '', bottleCount: '', directSize: '', directUnit: '병', directCount: '' });
   };
 
   const handleAdminLogin = () => {
@@ -590,10 +603,26 @@ export default function App() {
       handleDeleteRequest(targetReq, true);
   };
 
+  const applyQuickChemical = (names = []) => {
+      const candidates = (Array.isArray(names) ? names : [names]).filter(Boolean);
+      const chem = chemicals.find(c => candidates.some(name => String(c.name || '').toLowerCase() === String(name || '').toLowerCase()));
+      setRequestForm(prev => ({
+          ...prev,
+          chemicalName: chem ? chem.name : (candidates[0] || prev.chemicalName),
+          chemType: chem ? chem.type : prev.chemType,
+          cas: chem ? chem.cas : prev.cas
+      }));
+      setIsChemDropdownOpen(false);
+  };
+
   // --- CRUD Operations ---
   const submitRequest = async (keepForm = false) => {
+    if (isSubmitting) return;
     if (!requestForm.labName || !requestForm.chemicalName || !requestForm.amount) {
       showAlert("안내", "필수 정보(저장소·실험실·물질명·수량)를 모두 입력해주세요."); return;
+    }
+    if (!requestForm.actionDate) {
+      showAlert("안내", "반출입 예정일을 선택해주세요."); return;
     }
     const normalizedRequestorName = normalizeName(requestForm.requestorName);
     if (!normalizedRequestorName) {
@@ -625,6 +654,7 @@ export default function App() {
         createdAt: Date.now(), 
         status: 'PENDING', 
         date: getTodayString(), 
+        actionDate: requestForm.actionDate || getTodayString(),
         shelf: '미지정', 
         chemType: chem ? chem.type : '미지정', 
         cas: chem ? chem.cas : '-',
@@ -637,6 +667,7 @@ export default function App() {
         bottleCount: finalBotCount
     };
     
+    setIsSubmitting(true);
     try {
         if (isDemoMode) {
             setRequests([{...newRequest, id: Date.now()}, ...requests]);
@@ -649,13 +680,15 @@ export default function App() {
             // signatureData, requestorName은 유지 (초기화하지 않음)
             showAlert("성공", "신청이 완료되었습니다. 다음 물질을 신청해주세요.");
         } else {
-            setRequestForm({ type: 'IN', labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', chemType: '', requestorName: '', bottleSize: 0, bottleUnit: '', bottleCount: '', directSize: '', directUnit: '병', directCount: '' });
+            setRequestForm({ type: 'IN', actionDate: getTodayString(), labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', chemType: '', requestorName: '', bottleSize: 0, bottleUnit: '', bottleCount: '', directSize: '', directUnit: '병', directCount: '' });
             setSignatureData('');
             setSignaturePadKey(k => k + 1);
             navigateTo('my_requests');
         }
     } catch (e) {
         showAlert("오류", "신청 중 오류가 발생했습니다.");
+    } finally {
+        setIsSubmitting(false);
     }
   };
 
@@ -712,7 +745,7 @@ export default function App() {
         
         setInventory(newInventory);
         setRequests(requests.map(r => r.id === req.id ? { ...r, status: 'APPROVED' } : r));
-        setHistory([{ ...req, actionDate: getTodayString(), status: 'APPROVED', processedAt: Date.now() }, ...history]);
+        setHistory([{ ...req, actionDate: req.actionDate || getTodayString(), status: 'APPROVED', processedAt: Date.now() }, ...history]);
         return;
     }
 
@@ -778,7 +811,7 @@ export default function App() {
 
         const histRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'history'));
         batch.set(histRef, { 
-            ...req, actionDate: getTodayString(), status: 'APPROVED', 
+            ...req, actionDate: req.actionDate || getTodayString(), status: 'APPROVED', 
             cas: req.cas || '-', originalReqId: req.id, processedAt: Date.now() 
         });
 
@@ -1241,6 +1274,19 @@ export default function App() {
       );
   };
 
+  const renderSubmittingOverlay = () => {
+      if (!isSubmitting) return null;
+      return (
+          <div className="fixed inset-0 bg-black/45 z-[190] flex items-center justify-center p-4">
+              <div className="bg-white rounded-2xl shadow-2xl px-8 py-7 text-center max-w-sm w-full">
+                  <div className="w-12 h-12 border-4 border-blue-200 border-t-blue-600 rounded-full animate-spin mx-auto mb-4"></div>
+                  <h3 className="text-lg font-bold text-slate-800">잠시만 기다려주세요</h3>
+                  <p className="text-sm text-slate-500 mt-2">반출입 신청을 저장하고 있습니다. 중복 제출을 막기 위해 버튼은 잠시 비활성화됩니다.</p>
+              </div>
+          </div>
+      );
+  };
+
   const renderBulkImportModal = () => {
     if (!bulkImportModal) return null;
     const SAMPLE_URL = "data:text/csv;charset=utf-8,\uFEFF유형(IN/OUT),저장소,실험실명,물질명,수량(L),단위,병수,병단위,제조사,신청자성명\nIN,제1공학관,연구실A,Acetone,20,L,5,병,삼전순약공업,홍길동\nIN,제1공학관,연구실A,Methanol,18,L,1,캔,삼전순약공업,홍길동\nOUT,제1공학관,연구실A,Acetone,4,L,1,병,,홍길동\nIN,제1공학관,연구실B,에탄올,2.5,L,1,병,,김연구";
@@ -1579,14 +1625,9 @@ export default function App() {
 
     return (
       <div className="max-w-3xl mx-auto bg-white p-4 md:p-8 rounded-xl shadow-sm border border-slate-200">
-        <div className="flex items-center justify-between mb-6 border-b pb-4">
+        <div className="mb-6 border-b pb-4">
           <h2 className="text-2xl font-bold text-slate-800">위험물 반출/반입 신청서</h2>
-          <button 
-            onClick={() => { setBulkImportRows([]); setBulkImportErrors([]); setBulkImportModal(true); }}
-            className="flex items-center gap-2 px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 font-bold text-sm shadow transition"
-          >
-            <FileSpreadsheet size={16}/> 엑셀 일괄 등록
-          </button>
+          <p className="text-sm text-slate-500 mt-2">반출입 신청은 이제 개별 입력만 지원합니다. 반출입 예정일과 주요 물질 퀵버튼을 활용하면 더 빠르게 등록할 수 있습니다.</p>
         </div>
 
         {currentUser === 'user' && (
@@ -1605,6 +1646,14 @@ export default function App() {
                             {t === 'IN' ? '반입 (입고)' : '반출 (출고)'}
                         </button>
                     ))}
+                </div>
+            </div>
+            <div className="flex flex-col gap-2">
+                <label className="text-sm font-bold text-slate-700">반출입 예정일</label>
+                <input type="date" className="border p-3 rounded-lg bg-white focus:ring-2 focus:ring-blue-500 focus:outline-none" value={requestForm.actionDate} onChange={(e) => setRequestForm({...requestForm, actionDate: e.target.value})} />
+                <div className="flex gap-2 flex-wrap">
+                    <button type="button" onClick={() => setRequestForm({...requestForm, actionDate: getTodayString()})} className="px-2.5 py-1 rounded-full bg-slate-100 text-slate-600 text-xs font-bold hover:bg-slate-200">오늘</button>
+                    <button type="button" onClick={() => { const d = new Date(); d.setDate(d.getDate() + 1); setRequestForm({...requestForm, actionDate: `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}); }} className="px-2.5 py-1 rounded-full bg-slate-100 text-slate-600 text-xs font-bold hover:bg-slate-200">내일</button>
                 </div>
             </div>
             <div className="flex flex-col gap-2">
@@ -1653,6 +1702,25 @@ export default function App() {
         </div>
 
         <div className="space-y-4 mb-8">
+             <div className="flex flex-col gap-2">
+                <label className="text-sm font-bold text-slate-700">자주 쓰는 물질 퀵버튼</label>
+                <div className="flex flex-wrap gap-2">
+                    {QUICK_CHEMICAL_BUTTONS.map(btn => {
+                        const matched = btn.names.some(name => String(requestForm.chemicalName || '').toLowerCase() === String(name).toLowerCase());
+                        return (
+                            <button
+                                key={btn.label}
+                                type="button"
+                                onClick={() => applyQuickChemical(btn.names)}
+                                className={`px-3 py-2 rounded-full text-xs md:text-sm font-bold border transition ${matched ? 'bg-blue-600 text-white border-blue-600 shadow' : 'bg-white text-slate-600 border-slate-200 hover:border-blue-300 hover:text-blue-700'}`}
+                            >
+                                {btn.label}
+                            </button>
+                        );
+                    })}
+                </div>
+                <p className="text-xs text-slate-400">버튼을 누르면 물질명과 등록된 성상/CAS 정보가 자동으로 채워집니다.</p>
+            </div>
              <div className="flex flex-col gap-2 relative">
                 <label className="text-sm font-bold text-slate-700">물질명 검색</label>
                 <div className="flex gap-2">
@@ -1814,11 +1882,11 @@ export default function App() {
         </div>
 
         <div className="flex flex-col gap-3">
-          <button onClick={() => submitRequest(false)} className={`w-full py-4 rounded-xl font-bold text-lg shadow-lg transition transform active:scale-95 ${requestForm.type === 'IN' ? 'bg-green-600 hover:bg-green-700 text-white' : 'bg-red-600 hover:bg-red-700 text-white'}`}>
-            {requestForm.type === 'IN' ? '📦 반입 신청 완료 (내역으로 이동)' : '📤 반출 신청 완료 (내역으로 이동)'}
+          <button disabled={isSubmitting} onClick={() => submitRequest(false)} className={`w-full py-4 rounded-xl font-bold text-lg shadow-lg transition transform active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed ${requestForm.type === 'IN' ? 'bg-green-600 hover:bg-green-700 text-white' : 'bg-red-600 hover:bg-red-700 text-white'}`}>
+            {isSubmitting ? '잠시만 기다려주세요...' : (requestForm.type === 'IN' ? '📦 반입 신청 완료 (내역으로 이동)' : '📤 반출 신청 완료 (내역으로 이동)')}
           </button>
-          <button onClick={() => submitRequest(true)} className={`w-full py-3 rounded-xl font-bold text-base border-2 transition transform active:scale-95 ${requestForm.type === 'IN' ? 'border-green-600 text-green-700 hover:bg-green-50' : 'border-red-600 text-red-700 hover:bg-red-50'} bg-white`}>
-            ➕ 이어서 다른 물질 신청 (저장소·실험실 유지)
+          <button disabled={isSubmitting} onClick={() => submitRequest(true)} className={`w-full py-3 rounded-xl font-bold text-base border-2 transition transform active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed ${requestForm.type === 'IN' ? 'border-green-600 text-green-700 hover:bg-green-50' : 'border-red-600 text-red-700 hover:bg-red-50'} bg-white`}>
+            {isSubmitting ? '저장 중...' : '➕ 이어서 다른 물질 신청 (저장소·실험실 유지)'}
           </button>
         </div>
       </div>
@@ -2391,7 +2459,9 @@ export default function App() {
     const pendingReqs = requests.filter(req => req.status === 'PENDING');
     const allReqs = requests;
     // approvalViewTab은 이제 컴포넌트 레벨 state 사용 (훅 위반 수정)
-    const displayReqs = approvalViewTab === 'pending' ? pendingReqs : allReqs;
+    const displayReqs = (approvalViewTab === 'pending' ? pendingReqs : allReqs)
+      .slice()
+      .sort((a, b) => String(a.actionDate || '9999-12-31').localeCompare(String(b.actionDate || '9999-12-31')) || ((b.createdAt || 0) - (a.createdAt || 0)));
 
     return (
     <div className="space-y-4">
@@ -2408,12 +2478,14 @@ export default function App() {
       </div>
 
       <div className="bg-white rounded-xl shadow border overflow-x-auto">
-        <table className="w-full text-left text-sm whitespace-nowrap min-w-[700px]">
+        <table className="w-full text-left text-sm whitespace-nowrap min-w-[920px]">
           <thead className="bg-slate-50 border-b">
             <tr>
               <th className="p-2 md:p-3">구분</th>
+              <th className="p-2 md:p-3">반출입일</th>
               <th className="p-2 md:p-3">신청자</th>
               <th className="p-2 md:p-3">저장소/실험실</th>
+              <th className="p-2 md:p-3">내선</th>
               <th className="p-2 md:p-3">물질/수량</th>
               <th className="p-2 md:p-3">상태</th>
               <th className="p-2 md:p-3 text-center">작업</th>
@@ -2421,14 +2493,16 @@ export default function App() {
           </thead>
           <tbody className="divide-y">
             {displayReqs.length === 0 ? (
-                <tr><td colSpan="6" className="p-8 text-center text-slate-500">항목이 없습니다.</td></tr>
+                <tr><td colSpan="8" className="p-8 text-center text-slate-500">항목이 없습니다.</td></tr>
             ) : (
                 displayReqs.map(req => (
                 <tr key={req.id} className={req.status === 'PENDING' ? 'bg-blue-50/30' : req.status === 'APPROVED' ? 'bg-green-50/20' : 'bg-red-50/10'}>
                     <td className="p-2 md:p-3"><span className={`px-1.5 py-0.5 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{req.type === 'IN' ? '반입' : '반출'}</span></td>
+                    <td className="p-2 md:p-3 text-xs font-bold text-slate-700">{req.actionDate || req.date || '-'}</td>
                     <td className="p-2 md:p-3 font-medium text-slate-700 text-xs">{req.requestorName ? <span className="flex items-center gap-1">{req.signature && <span title="서명있음" className="text-green-500">✍️</span>}{req.requestorName}</span> : <span className="text-slate-300 text-xs">-</span>}</td>
                     <td className="p-2 md:p-3"><div className="font-bold text-xs">{req.storage}</div><div className="text-xs text-slate-500">{req.labName}</div></td>
-                    <td className="p-2 md:p-3"><div className="font-bold text-xs">{req.chemicalName}</div><div className="text-xs text-blue-600">{req.bottleSize > 0 && req.bottleUnit ? `${req.bottleCount}${req.bottleUnit}(${req.amount}L)` : `${req.amount}${req.unit}`}</div><div className="text-xs text-slate-400">{req.manufacturer}</div></td>
+                    <td className="p-2 md:p-3 text-xs text-slate-600 font-medium">{req.ext || '-'}</td>
+                    <td className="p-2 md:p-3"><div className="font-bold text-xs">{req.chemicalName}</div><div className="text-xs text-blue-600">{formatBottleDisplay(req.amount, req.unit, req.bottleSize, req.bottleUnit, req.bottleCount, true)}</div><div className="text-xs text-slate-400">{req.manufacturer}</div></td>
 
                     <td className="p-2 md:p-3">
                       {req.status === 'PENDING' && <span className="px-1.5 py-0.5 bg-yellow-100 text-yellow-700 rounded text-xs font-bold">대기중</span>}
@@ -2467,6 +2541,10 @@ export default function App() {
                     <option value="IN">반입 (입고)</option>
                     <option value="OUT">반출 (출고)</option>
                   </select>
+                </div>
+                <div>
+                  <label className="text-xs font-bold text-slate-600 mb-1 block">반출입 예정일</label>
+                  <input type="date" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500" value={editingRequest.actionDate || editingRequest.date || getTodayString()} onChange={e=>setEditingRequest({...editingRequest, actionDate: e.target.value})}/>
                 </div>
                 <div>
                   <label className="text-xs font-bold text-slate-600 mb-1 block">신청자 성명</label>
@@ -3007,8 +3085,8 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
   return (
     <div className="flex h-screen bg-slate-50 font-sans text-slate-800">
       {renderModal()}
-      {renderBulkImportModal()}
-      {renderInvEditModal()}{/* ✅ 로그인 후에도 엑셀 모달이 표시되도록 최상위에 배치 */}
+      {renderInvEditModal()}
+      {renderSubmittingOverlay()}
       {!currentUser ? renderLoginScreen() : (
           <>
              {renderSidebar()}

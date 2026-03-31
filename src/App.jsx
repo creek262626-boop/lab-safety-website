@@ -30,7 +30,7 @@ import { getAuth, signInAnonymously, onAuthStateChanged } from "firebase/auth";
  * 추가 강화: Firebase Authentication → 로그인 제공업체에서
  * "익명" 만 활성화하고 나머지는 비활성화하세요.
  */
-import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, query, writeBatch } from "firebase/firestore";
+import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, query, writeBatch, deleteField } from "firebase/firestore";
 
 // 🔴 [수정 필요] 아래 값들을 Firebase 콘솔에서 복사한 값으로 바꿔주세요.
 const firebaseConfig = {
@@ -49,21 +49,7 @@ const getTodayString = () => {
   return `${date.getFullYear()}-${("0" + (date.getMonth() + 1)).slice(-2)}-${("0" + date.getDate()).slice(-2)}`;
 };
 
-const PRIVACY_CONSENT_TEXT = [
-  '■ 개인정보 제공 동의 : 개인정보호법 제15조 및 제22조에 의거 귀하의 동의를 받고자 합니다.',
-  '■ 수집하는 개인정보항목 : 성명',
-  '■ 개인정보수집 및 이용목적 : 위험물 저장소 이용 관리',
-  '■ 개인정보의 보유 및 이용기간 : 수집된 개인정보는 이용자 변경 시 파기됩니다.'
-];
-
 const normalizeName = (name) => String(name || '').trim();
-
-const maskRequestorName = (name) => {
-    const safe = normalizeName(name);
-    if (!safe) return '-';
-    if (safe.length === 1) return `${safe}*`;
-    return `${safe[0]}${'*'.repeat(Math.max(safe.length - 1, 1))}`;
-};
 
 const QUICK_CHEMICAL_BUTTONS = [
     { label: 'Acetone (아세톤)', names: ['Acetone', '아세톤'] },
@@ -74,6 +60,36 @@ const QUICK_CHEMICAL_BUTTONS = [
     { label: 'Methanol (메탄올)', names: ['Methanol', '메탄올'] },
     { label: 'n-Hexane (노말헥산)', names: ['n-Hexane', '노말헥산', 'Hexane'] },
 ];
+
+const normalizeChemicalKey = (name) => String(name || '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+const getQuickChemicalMeta = (value) => {
+    const key = normalizeChemicalKey(value);
+    if (!key) return null;
+    return QUICK_CHEMICAL_BUTTONS.find(btn => [btn.label, ...btn.names].some(candidate => normalizeChemicalKey(candidate) === key)) || null;
+};
+
+const buildChemicalAliases = (chemicalName) => {
+    const meta = getQuickChemicalMeta(chemicalName);
+    return Array.from(new Set([chemicalName, meta?.label, ...(meta?.names || [])].filter(Boolean)));
+};
+
+const getPreferredChemicalLabel = (chemicalName) => {
+    const meta = getQuickChemicalMeta(chemicalName);
+    return meta?.label || chemicalName || '';
+};
+
+const matchesChemicalKeyword = (chemicalName, keyword) => {
+    const needle = normalizeChemicalKey(keyword);
+    if (!needle) return true;
+    return buildChemicalAliases(chemicalName).some(alias => normalizeChemicalKey(alias).includes(needle));
+};
+
+const matchesShelfKeyword = (shelf, keyword) => {
+    const normalizedShelf = normalizeChemicalKey(shelf).replace(/\s+/g, '');
+    const normalizedKeyword = normalizeChemicalKey(keyword).replace(/\s+/g, '');
+    return !normalizedKeyword || normalizedShelf.includes(normalizedKeyword);
+};
 
 // 병/캔 단위 표시 헬퍼 (연구원용)
 const formatBottleDisplay = (amount, unit, bottleSize, bottleUnit, bottleCount, isAdmin = false) => {
@@ -380,7 +396,7 @@ export default function App() {
   const [newChemData, setNewChemData] = useState({ cas: '', name: '', type: '1석유류(비)' });
   const [newManufacturer, setNewManufacturer] = useState('');
 
-  const [requestForm, setRequestForm] = useState({ type: 'IN', actionDate: getTodayString(), labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', requestorName: '', bottleSize: 0, bottleUnit: '', bottleCount: '', directSize: '', directUnit: '병', directCount: '' });
+  const [requestForm, setRequestForm] = useState({ type: 'IN', actionDate: getTodayString(), labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', bottleSize: 0, bottleUnit: '', bottleCount: '', directSize: '', directUnit: '병', directCount: '' });
   const [expandedStats, setExpandedStats] = useState({});
   const [isChemDropdownOpen, setIsChemDropdownOpen] = useState(false);
   const [editingRequest, setEditingRequest] = useState(null); // 승인화면 편집 모달용
@@ -395,13 +411,57 @@ export default function App() {
   // ── 승인 탭 상태 (훅 위반 수정: renderApprovalScreen 내부에서 이동) ──
   const [approvalViewTab, setApprovalViewTab] = useState('pending');
 
-  // ── 서명 관련 상태 ──
-  const [signatureData, setSignatureData] = useState('');      // 신청 폼 현재 서명 (base64)
-  const [signaturePadKey, setSignaturePadKey] = useState(0);   // 서명 패드 강제 초기화용 key
-  const [signatureViewModal, setSignatureViewModal] = useState(null); // 서명 확인 모달 (이미지 URL)
   const [invFilter, setInvFilter] = useState({ storage: 'All', labName: 'All' }); // 재고 현황 조회 필터
   const [invSort, setInvSort] = useState({ key: 'storage', dir: 'asc' }); // 재고 현황 정렬
   const [invEditModal, setInvEditModal] = useState(null); // 재고 병/캔 단위 편집 모달
+  const legacyCleanupRef = useRef({ requests: false, history: false });
+
+  const stripSensitiveRequestFields = useCallback((item) => {
+    if (!item) return item;
+    const { signature, requestorName, ...rest } = item;
+    return rest;
+  }, []);
+
+  const findChemicalByAnyName = useCallback((value) => {
+    const key = normalizeChemicalKey(value);
+    if (!key) return null;
+    return chemicals.find((chemical) => buildChemicalAliases(chemical.name).some(alias => normalizeChemicalKey(alias) === key)) || null;
+  }, [chemicals]);
+
+  const getSuggestedShelves = useCallback((storage, labName, keyword = '') => {
+    if (!storage || !labName) return [];
+    const pool = [...inventory, ...requests]
+      .filter(item => item.storage === storage && item.labName === labName && item.shelf && item.shelf !== '미지정')
+      .map(item => String(item.shelf).trim())
+      .filter(Boolean);
+
+    return Array.from(new Set(pool))
+      .filter(shelf => matchesShelfKeyword(shelf, keyword))
+      .sort((a, b) => a.localeCompare(b, 'ko', { numeric: true }));
+  }, [inventory, requests]);
+
+  const cleanupLegacyPersonalFields = useCallback(async (collectionName, items) => {
+    if (isDemoMode || !db || !user || legacyCleanupRef.current[collectionName]) return;
+
+    const targets = items.filter(item => item.signature !== undefined || item.requestorName !== undefined);
+    if (targets.length === 0) return;
+
+    legacyCleanupRef.current[collectionName] = true;
+    try {
+      for (let i = 0; i < targets.length; i += 400) {
+        const batch = writeBatch(db);
+        targets.slice(i, i + 400).forEach((item) => {
+          const docRef = doc(db, 'artifacts', appId, 'public', 'data', collectionName, item.id);
+          batch.update(docRef, { signature: deleteField(), requestorName: deleteField() });
+        });
+        await batch.commit();
+      }
+    } catch (error) {
+      console.error(`[민감정보 정리 실패] ${collectionName}`, error);
+    } finally {
+      legacyCleanupRef.current[collectionName] = false;
+    }
+  }, [appId, db, isDemoMode, user]);
 
   // --- 1. Firebase Setup ---
   useEffect(() => {
@@ -497,11 +557,13 @@ export default function App() {
     });
     const unsubReq = onSnapshot(reqRef, (snapshot) => {
         const data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
-        setRequests(data.sort((a,b) => b.createdAt - a.createdAt));
+        cleanupLegacyPersonalFields('requests', data);
+        setRequests(data.map(stripSensitiveRequestFields).sort((a,b) => b.createdAt - a.createdAt));
     });
     const unsubHist = onSnapshot(histRef, (snapshot) => {
         const data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
-        setHistory(data.sort((a,b) => b.processedAt - a.processedAt));
+        cleanupLegacyPersonalFields('history', data);
+        setHistory(data.map(stripSensitiveRequestFields).sort((a,b) => b.processedAt - a.processedAt));
     });
 
     const noticesRef = collection(db, 'artifacts', appId, 'public', 'data', 'notices');
@@ -513,7 +575,7 @@ export default function App() {
     return () => {
         unsubLabs(); unsubChems(); unsubManuf(); unsubInv(); unsubReq(); unsubHist(); unsubNotices();
     };
-  }, [user, db, appId, isDemoMode]);
+  }, [user, db, appId, isDemoMode, cleanupLegacyPersonalFields, stripSensitiveRequestFields]);
 
 
   // --- Logic Helpers ---
@@ -538,9 +600,6 @@ export default function App() {
       setActiveTab('dashboard');
       setIsMobileMenuOpen(false);
       setApprovalViewTab('pending');
-      setSignatureData('');
-      setSignaturePadKey(k => k + 1);
-      setSignatureViewModal(null);
       setInvFilter({ storage: 'All', labName: 'All' });
       setInvSort({ key: 'storage', dir: 'asc' });
       setInvEditModal(null);
@@ -550,7 +609,7 @@ export default function App() {
       setDeleteNameModal(null);
       setDeleteNameInput('');
       setIsSubmitting(false);
-      setRequestForm({ type: 'IN', actionDate: getTodayString(), labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', requestorName: '', bottleSize: 0, bottleUnit: '', bottleCount: '', directSize: '', directUnit: '병', directCount: '' });
+      setRequestForm({ type: 'IN', actionDate: getTodayString(), labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', bottleSize: 0, bottleUnit: '', bottleCount: '', directSize: '', directUnit: '병', directCount: '' });
   };
 
   const handleAdminLogin = () => {
@@ -565,50 +624,18 @@ export default function App() {
   };
 
   const handleUserEntry = () => {
-      setPrivacyConsentChecked(false);
-      setShowConsentModal(true);
-  };
-
-  const closeConsentModal = () => {
-      setShowConsentModal(false);
-      setPrivacyConsentChecked(false);
-  };
-
-  const confirmPrivacyConsent = () => {
-      if (!privacyConsentChecked) {
-          showAlert('안내', '개인정보 제공 동의 후 진행해주세요.');
-          return;
-      }
-      const consentTime = `${getTodayString()} ${new Date().toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })}`;
-      setPrivacyConsentAt(consentTime);
-      setShowConsentModal(false);
       setCurrentUser('user');
       navigateTo('request');
   };
 
-  const openDeleteNameModal = (req) => {
-      setDeleteNameModal(req);
-      setDeleteNameInput('');
-  };
-
-  const confirmDeleteWithName = () => {
-      if (!deleteNameModal) return;
-      if (normalizeName(deleteNameInput) !== normalizeName(deleteNameModal.requestorName)) {
-          showAlert('확인 필요', '신청 시 입력한 성명과 정확히 일치해야 삭제할 수 있습니다.');
-          return;
-      }
-      const targetReq = deleteNameModal;
-      setDeleteNameModal(null);
-      setDeleteNameInput('');
-      handleDeleteRequest(targetReq, true);
-  };
-
   const applyQuickChemical = (names = []) => {
       const candidates = (Array.isArray(names) ? names : [names]).filter(Boolean);
-      const chem = chemicals.find(c => candidates.some(name => String(c.name || '').toLowerCase() === String(name || '').toLowerCase()));
+      const chem = candidates.map(candidate => findChemicalByAnyName(candidate)).find(Boolean) || null;
+      const preferredLabel = getPreferredChemicalLabel(candidates[0] || chem?.name || '');
+
       setRequestForm(prev => ({
           ...prev,
-          chemicalName: chem ? chem.name : (candidates[0] || prev.chemicalName),
+          chemicalName: chem ? getPreferredChemicalLabel(chem.name) : (preferredLabel || prev.chemicalName),
           chemType: chem ? chem.type : prev.chemType,
           cas: chem ? chem.cas : prev.cas
       }));
@@ -624,17 +651,7 @@ export default function App() {
     if (!requestForm.actionDate) {
       showAlert("안내", "반출입 예정일을 선택해주세요."); return;
     }
-    const normalizedRequestorName = normalizeName(requestForm.requestorName);
-    if (!normalizedRequestorName) {
-      showAlert("안내", "신청자 성명을 입력해주세요."); return;
-    }
-    if (currentUser === 'user' && !privacyConsentAt) {
-      showAlert("안내", "개인정보 제공 동의를 완료한 뒤 신청할 수 있습니다."); return;
-    }
-    if (!signatureData) {
-      showAlert("안내", "서명란에 서명을 해주세요."); return;
-    }
-    const chem = chemicals.find(c => c.name === requestForm.chemicalName);
+    const chem = findChemicalByAnyName(requestForm.chemicalName);
     // 프리셋(4L병/18L캔) 처리
     const presetCnt = requestForm.bottleSize > 0 ? Number(requestForm.bottleCount) : 0;
     const presetAmt = requestForm.bottleSize > 0 && presetCnt > 0
@@ -658,9 +675,8 @@ export default function App() {
         shelf: '미지정', 
         chemType: chem ? chem.type : '미지정', 
         cas: chem ? chem.cas : '-',
-        signature: signatureData,
         ...requestForm,
-        requestorName: normalizedRequestorName || '서명자',
+        chemicalName: chem ? getPreferredChemicalLabel(chem.name) : requestForm.chemicalName,
         amount: finalAmt,
         bottleSize: finalBotSz,
         bottleUnit: finalBotUnit,
@@ -675,14 +691,11 @@ export default function App() {
             await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'requests'), newRequest);
         }
         if (keepForm) {
-            // 이어서 신청: 저장소·실험실·유형·이름·서명 유지, 물질/수량/제조사만 초기화
+            // 이어서 신청: 저장소·실험실·유형 유지, 물질/수량/제조사만 초기화
             setRequestForm(prev => ({ ...prev, chemicalName: '', amount: '', manufacturer: '', chemType: '', cas: '', unit: 'L', bottleSize: 0, bottleUnit: '', bottleCount: '', directSize: '', directUnit: '병', directCount: '' }));
-            // signatureData, requestorName은 유지 (초기화하지 않음)
             showAlert("성공", "신청이 완료되었습니다. 다음 물질을 신청해주세요.");
         } else {
-            setRequestForm({ type: 'IN', actionDate: getTodayString(), labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', chemType: '', requestorName: '', bottleSize: 0, bottleUnit: '', bottleCount: '', directSize: '', directUnit: '병', directCount: '' });
-            setSignatureData('');
-            setSignaturePadKey(k => k + 1);
+            setRequestForm({ type: 'IN', actionDate: getTodayString(), labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', chemType: '', bottleSize: 0, bottleUnit: '', bottleCount: '', directSize: '', directUnit: '병', directCount: '' });
             navigateTo('my_requests');
         }
     } catch (e) {
@@ -836,6 +849,10 @@ export default function App() {
   };
 
   const handleDeleteRequest = (req, skipConfirm = false) => {
+    if (currentUser !== 'admin') {
+        showAlert('안내', '연구실 사용자는 신청 내역을 삭제할 수 없습니다. 관리자에게 요청해주세요.');
+        return;
+    }
     const executeApprovedDelete = async () => {
         if (isDemoMode) {
             // ✅ 데모 모드 재고 롤백 로직 추가
@@ -1046,17 +1063,15 @@ export default function App() {
         const col9         = String(parts[9] || '').trim();
         // 병수/병단위 자동 감지
         const BOTTLE_UNITS = ['병','캔','개','팩','박스'];
-        let bottleCount = 0, bottleUnit = '', manufacturer = '', requestorName = '';
+        let bottleCount = 0, bottleUnit = '', manufacturer = '';
         if (parts.length >= 10) {
-          // 10컬럼 이상: 유형,저장소,실험실명,물질명,수량,단위,병수,병단위,제조사,신청자
+          // 10컬럼 이상: 유형,저장소,실험실명,물질명,수량,단위,병수,병단위,제조사,(구형)신청자
           bottleCount   = isNaN(Number(col6)) ? 0 : Number(col6);
           bottleUnit    = BOTTLE_UNITS.includes(col7) ? col7 : '';
           manufacturer  = col8;
-          requestorName = col9;
         } else {
-          // 8컬럼 구형: 유형,저장소,실험실명,물질명,수량,단위,제조사,신청자
+          // 8컬럼 구형: 유형,저장소,실험실명,물질명,수량,단위,제조사,(구형)신청자
           manufacturer  = col6;
-          requestorName = col7;
         }
 
         const rowErrors = [];
@@ -1066,9 +1081,8 @@ export default function App() {
         if (!chemicalName) rowErrors.push(`물질명 누락`);
         if (isNaN(amount) || amount <= 0) rowErrors.push(`수량 오류: "${parts[4]}"`);
         if (!UNITS.includes(unit) && !['L','mL','kg','g'].includes(unit)) rowErrors.push(`단위 오류(${UNITS.join('/')})`);
-        if (!requestorName) rowErrors.push(`신청자 성명 누락`);
 
-        const chem = chemicals.find(c => c.name === chemicalName);
+        const chem = findChemicalByAnyName(chemicalName);
         const lab = labs.find(l => l.name === labName);
         const ext = lab ? lab.ext : '';
         const calcBottleSize = bottleCount > 0 && amount > 0 ? amount / bottleCount : 0;
@@ -1078,14 +1092,14 @@ export default function App() {
         } else {
           parsed.push({
             _rowNum: rowNum, _valid: true,
-            type, storage, labName, ext, chemicalName,
+            type, storage, labName, ext, chemicalName: chem ? getPreferredChemicalLabel(chem.name) : chemicalName,
             chemType: chem ? chem.type : '미지정',
             cas: chem ? chem.cas : '-',
             amount: String(amount), unit,
             bottleCount: bottleCount > 0 ? String(bottleCount) : '',
             bottleUnit: bottleUnit,
             bottleSize: calcBottleSize,
-            manufacturer, requestorName,
+            manufacturer,
             shelf: '미지정',
           });
         }
@@ -1122,9 +1136,7 @@ export default function App() {
         bottleUnit: row.bottleUnit || '',
         bottleCount: row.bottleCount || '',
         manufacturer: row.manufacturer,
-        requestorName: row.requestorName,
         shelf: row.shelf,
-        signature: '',
       };
       try {
         if (isDemoMode) {
@@ -1289,7 +1301,7 @@ export default function App() {
 
   const renderBulkImportModal = () => {
     if (!bulkImportModal) return null;
-    const SAMPLE_URL = "data:text/csv;charset=utf-8,\uFEFF유형(IN/OUT),저장소,실험실명,물질명,수량(L),단위,병수,병단위,제조사,신청자성명\nIN,제1공학관,연구실A,Acetone,20,L,5,병,삼전순약공업,홍길동\nIN,제1공학관,연구실A,Methanol,18,L,1,캔,삼전순약공업,홍길동\nOUT,제1공학관,연구실A,Acetone,4,L,1,병,,홍길동\nIN,제1공학관,연구실B,에탄올,2.5,L,1,병,,김연구";
+    const SAMPLE_URL = "data:text/csv;charset=utf-8,\uFEFF유형(IN/OUT),저장소,실험실명,물질명,수량(L),단위,병수,병단위,제조사,\nIN,제1공학관,연구실A,Acetone,20,L,5,병,삼전순약공업,홍길동\nIN,제1공학관,연구실A,Methanol,18,L,1,캔,삼전순약공업,홍길동\nOUT,제1공학관,연구실A,Acetone,4,L,1,병,,홍길동\nIN,제1공학관,연구실B,에탄올,2.5,L,1,병,,김연구";
     return (
       <div className="fixed inset-0 bg-black/70 z-[200] flex items-center justify-center p-2 md:p-4">
         <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[95vh] flex flex-col">
@@ -1318,7 +1330,7 @@ export default function App() {
                 <Download size={16}/> 양식 다운로드
               </a>
               <div className="text-xs text-slate-500 bg-slate-50 border rounded-lg p-2 flex-1 min-w-[200px]">
-                <strong>컬럼 순서:</strong> 유형(IN/OUT) | 저장소 | 실험실명 | 물질명 | 수량(L) | 단위 | 병수 | 병단위 | 제조사 | 신청자성명
+                <strong>컬럼 순서:</strong> 유형(IN/OUT) | 저장소 | 실험실명 | 물질명 | 수량(L) | 단위 | 병수 | 병단위 | 제조사
               </div>
             </div>
 
@@ -1347,7 +1359,7 @@ export default function App() {
                   <table className="w-full text-xs">
                     <thead className="bg-slate-100 sticky top-0">
                       <tr>
-                        {['#','유형','저장소','실험실','물질명','수량','단위','병/캔','제조사','신청자'].map(h => (
+                        {['#','유형','저장소','실험실','물질명','수량','단위','병/캔','제조사'].map(h => (
                           <th key={h} className="p-2 text-left font-bold text-slate-600 whitespace-nowrap">{h}</th>
                         ))}
                         <th className="p-2">제거</th>
@@ -1365,7 +1377,6 @@ export default function App() {
                           <td className="p-2">{row.unit}</td>
                           <td className="p-2 whitespace-nowrap text-xs text-blue-600">{row.bottleCount ? `${row.bottleCount}${row.bottleUnit}` : '-'}</td>
                           <td className="p-2">{row.manufacturer || '-'}</td>
-                          <td className="p-2">{row.requestorName}</td>
                           <td className="p-2 text-center">
                             <button onClick={() => setBulkImportRows(prev => prev.filter((_,idx) => idx !== i))} className="text-red-400 hover:text-red-600"><X size={14}/></button>
                           </td>
@@ -1529,32 +1540,6 @@ export default function App() {
               </div>
           </div>
       )}
-
-      {showConsentModal && (
-          <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
-              <div className="bg-white p-6 rounded-2xl shadow-2xl w-full max-w-lg">
-                  <h3 className="text-xl font-bold text-slate-800 flex items-center gap-2 mb-3"><ShieldAlert size={20} className="text-blue-600" /> 개인정보 제공 동의</h3>
-                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-2 text-sm text-slate-700 whitespace-pre-wrap">
-                      {PRIVACY_CONSENT_TEXT.map((line, idx) => (
-                          <p key={idx}>{line}</p>
-                      ))}
-                  </div>
-                  <label className="mt-4 flex items-start gap-3 p-3 rounded-xl border border-blue-200 bg-blue-50 text-sm text-slate-700 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        className="mt-1 h-4 w-4 accent-blue-600"
-                        checked={privacyConsentChecked}
-                        onChange={(e) => setPrivacyConsentChecked(e.target.checked)}
-                      />
-                      <span><span className="font-bold text-slate-800">위 내용을 확인하였으며 개인정보 제공에 동의합니다.</span><br /><span className="text-xs text-slate-500">동의해야 실험실 사용자 화면으로 이동할 수 있습니다.</span></span>
-                  </label>
-                  <div className="mt-5 flex gap-2">
-                      <button onClick={confirmPrivacyConsent} disabled={!privacyConsentChecked} className={`flex-1 py-3 rounded-lg font-bold text-white ${privacyConsentChecked ? 'bg-blue-600 hover:bg-blue-700' : 'bg-slate-300 cursor-not-allowed'}`}>동의하고 시작</button>
-                      <button onClick={closeConsentModal} className="flex-1 py-3 rounded-lg font-bold bg-slate-200 text-slate-700 hover:bg-slate-300">취소</button>
-                  </div>
-              </div>
-          </div>
-      )}
     </div>
   );
 
@@ -1601,7 +1586,7 @@ export default function App() {
           ) : (
             <>
               <NavItem tab="request" icon={PackagePlus} label="반출/반입 신청" />
-              <NavItem tab="my_requests" icon={History} label="내 신청 내역" />
+              <NavItem tab="my_requests" icon={History} label="신청 현황" />
               <NavItem tab="public_status" icon={LayoutDashboard} label="위험물 보관 현황" />
             </>
           )}
@@ -1620,7 +1605,7 @@ export default function App() {
     const storages = ['제1공학관', '제1과학기술관', '동물실험동'].sort();
     const filteredLabs = labs.filter(l => l.storage === requestForm.storage).sort((a,b) => a.name.localeCompare(b.name, 'ko'));
     const filteredChemicals = requestForm.chemicalName
-      ? chemicals.filter(chem => chem.name.toLowerCase().includes(requestForm.chemicalName.toLowerCase())).sort((a,b) => a.name.localeCompare(b.name))
+      ? chemicals.filter(chem => matchesChemicalKeyword(chem.name, requestForm.chemicalName)).sort((a,b) => a.name.localeCompare(b.name))
       : [...chemicals].sort((a,b) => a.name.localeCompare(b.name));
 
     return (
@@ -1630,12 +1615,9 @@ export default function App() {
           <p className="text-sm text-slate-500 mt-2">반출입 신청은 이제 개별 입력만 지원합니다. 반출입 예정일과 주요 물질 퀵버튼을 활용하면 더 빠르게 등록할 수 있습니다.</p>
         </div>
 
-        {currentUser === 'user' && (
-          <div className={`mb-5 rounded-xl border px-4 py-3 text-sm ${privacyConsentAt ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-amber-50 border-amber-200 text-amber-700'}`}>
-            <div className="font-bold">{privacyConsentAt ? '개인정보 제공 동의 완료' : '개인정보 제공 동의가 필요합니다'}</div>
-            <p className="mt-1">{privacyConsentAt ? `동의 시각: ${privacyConsentAt}` : '로그인 화면에서 개인정보 제공 동의를 완료해야 반출입 신청이 가능합니다.'}</p>
-          </div>
-        )}
+        <div className="mb-5 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+          신청자 성명, 서명, 개인정보 제공 동의 절차를 제거했습니다. 현재는 반출입 정보만 접수하며 기존 이름/서명 데이터는 자동 정리됩니다.
+        </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6 mb-6">
             <div className="flex flex-col gap-2">
@@ -1674,31 +1656,6 @@ export default function App() {
                 <label className="text-sm font-bold text-slate-700">내선번호</label>
                 <input type="text" className="border p-3 rounded-lg bg-slate-50 text-slate-500" value={requestForm.ext} readOnly placeholder="자동 입력됨" />
             </div>
-            <div className="flex flex-col gap-2 md:col-span-2">
-                <label className="text-sm font-bold text-slate-700">신청자 성명 <span className="text-red-500">*</span></label>
-                <input
-                  type="text"
-                  className="border p-3 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                  placeholder="반출입을 신청하는 분의 성명을 입력하세요"
-                  value={requestForm.requestorName}
-                  onChange={e => setRequestForm({...requestForm, requestorName: e.target.value})}
-                />
-            </div>
-            <div className="flex flex-col gap-2 md:col-span-2">
-                <label className="text-sm font-bold text-slate-700 flex items-center gap-1">
-                  ✍️ 신청자 서명 <span className="text-red-500">*</span>
-                  <span className="text-xs font-normal text-slate-400 ml-2">(손가락 또는 마우스로 서명하세요)</span>
-                </label>
-                <SignaturePad
-                  key={signaturePadKey}
-                  resetKey={signaturePadKey}
-                  onSave={(data) => setSignatureData(data)}
-                  onClear={() => setSignatureData('')}
-                />
-                {signatureData && (
-                  <p className="text-xs text-green-600 flex items-center gap-1 mt-0.5">✅ 서명이 완료되었습니다.</p>
-                )}
-            </div>
         </div>
 
         <div className="space-y-4 mb-8">
@@ -1728,7 +1685,7 @@ export default function App() {
                         <input 
                             type="text" 
                             className="w-full border p-3 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none" 
-                            placeholder="물질명 입력 또는 🔍 버튼으로 목록 검색" 
+                            placeholder="물질명 입력 또는 🔍 버튼으로 목록 검색 (한/영 자동 매칭)" 
                             value={requestForm.chemicalName} 
                             onChange={(e) => { setRequestForm({...requestForm, chemicalName: e.target.value}); setIsChemDropdownOpen(true); }}
                             onFocus={() => setIsChemDropdownOpen(true)}
@@ -1740,9 +1697,9 @@ export default function App() {
                                     <button 
                                         key={idx} 
                                         className="w-full text-left p-3 hover:bg-blue-50 text-sm border-b last:border-b-0 flex justify-between items-center"
-                                        onMouseDown={(e) => { e.preventDefault(); setRequestForm({...requestForm, chemicalName: chem.name, chemType: chem.type, cas: chem.cas}); setIsChemDropdownOpen(false); }}
+                                        onMouseDown={(e) => { e.preventDefault(); setRequestForm({...requestForm, chemicalName: getPreferredChemicalLabel(chem.name), chemType: chem.type, cas: chem.cas}); setIsChemDropdownOpen(false); }}
                                     >
-                                        <span className="font-bold text-slate-700">{chem.name}</span>
+                                        <span className="font-bold text-slate-700">{getPreferredChemicalLabel(chem.name)}</span>
                                         <span className="text-xs text-slate-400 bg-slate-100 px-2 py-0.5 rounded">{chem.type}</span>
                                     </button>
                                 )) : (
@@ -2462,6 +2419,11 @@ export default function App() {
     const displayReqs = (approvalViewTab === 'pending' ? pendingReqs : allReqs)
       .slice()
       .sort((a, b) => String(a.actionDate || '9999-12-31').localeCompare(String(b.actionDate || '9999-12-31')) || ((b.createdAt || 0) - (a.createdAt || 0)));
+    const approvedCount = requests.filter(req => req.status === 'APPROVED').length;
+    const rejectedCount = requests.filter(req => req.status === 'REJECTED').length;
+    const shelfSuggestions = editingRequest
+      ? getSuggestedShelves(editingRequest.storage, editingRequest.labName, editingRequest.shelf === '미지정' ? '' : (editingRequest.shelf || ''))
+      : [];
 
     return (
     <div className="space-y-4">
@@ -2477,14 +2439,31 @@ export default function App() {
         </button>
       </div>
 
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <div className="rounded-xl border border-orange-200 bg-orange-50 p-4">
+          <div className="text-xs font-bold text-orange-700">승인 대기</div>
+          <div className="mt-1 text-2xl font-bold text-orange-600">{pendingReqs.length}</div>
+          <div className="text-xs text-orange-500 mt-1">오늘 우선 확인이 필요한 건수</div>
+        </div>
+        <div className="rounded-xl border border-blue-200 bg-blue-50 p-4">
+          <div className="text-xs font-bold text-blue-700">승인 완료</div>
+          <div className="mt-1 text-2xl font-bold text-blue-600">{approvedCount}</div>
+          <div className="text-xs text-blue-500 mt-1">재고 반영까지 끝난 신청</div>
+        </div>
+        <div className="rounded-xl border border-rose-200 bg-rose-50 p-4">
+          <div className="text-xs font-bold text-rose-700">반려</div>
+          <div className="mt-1 text-2xl font-bold text-rose-600">{rejectedCount}</div>
+          <div className="text-xs text-rose-500 mt-1">검토 후 반려된 신청</div>
+        </div>
+      </div>
+
       <div className="bg-white rounded-xl shadow border overflow-x-auto">
-        <table className="w-full text-left text-sm whitespace-nowrap min-w-[920px]">
+        <table className="w-full text-left text-sm whitespace-nowrap min-w-[860px]">
           <thead className="bg-slate-50 border-b">
             <tr>
               <th className="p-2 md:p-3">구분</th>
               <th className="p-2 md:p-3">반출입일</th>
-              <th className="p-2 md:p-3">신청자</th>
-              <th className="p-2 md:p-3">저장소/실험실</th>
+                            <th className="p-2 md:p-3">저장소/실험실</th>
               <th className="p-2 md:p-3">내선</th>
               <th className="p-2 md:p-3">물질/수량</th>
               <th className="p-2 md:p-3">상태</th>
@@ -2493,14 +2472,13 @@ export default function App() {
           </thead>
           <tbody className="divide-y">
             {displayReqs.length === 0 ? (
-                <tr><td colSpan="8" className="p-8 text-center text-slate-500">항목이 없습니다.</td></tr>
+                <tr><td colSpan="5" className="p-8 text-center text-slate-500">항목이 없습니다.</td></tr>
             ) : (
                 displayReqs.map(req => (
                 <tr key={req.id} className={req.status === 'PENDING' ? 'bg-blue-50/30' : req.status === 'APPROVED' ? 'bg-green-50/20' : 'bg-red-50/10'}>
                     <td className="p-2 md:p-3"><span className={`px-1.5 py-0.5 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{req.type === 'IN' ? '반입' : '반출'}</span></td>
                     <td className="p-2 md:p-3 text-xs font-bold text-slate-700">{req.actionDate || req.date || '-'}</td>
-                    <td className="p-2 md:p-3 font-medium text-slate-700 text-xs">{req.requestorName ? <span className="flex items-center gap-1">{req.signature && <span title="서명있음" className="text-green-500">✍️</span>}{req.requestorName}</span> : <span className="text-slate-300 text-xs">-</span>}</td>
-                    <td className="p-2 md:p-3"><div className="font-bold text-xs">{req.storage}</div><div className="text-xs text-slate-500">{req.labName}</div></td>
+                                        <td className="p-2 md:p-3"><div className="font-bold text-xs">{req.storage}</div><div className="text-xs text-slate-500">{req.labName}</div></td>
                     <td className="p-2 md:p-3 text-xs text-slate-600 font-medium">{req.ext || '-'}</td>
                     <td className="p-2 md:p-3"><div className="font-bold text-xs">{req.chemicalName}</div><div className="text-xs text-blue-600">{formatBottleDisplay(req.amount, req.unit, req.bottleSize, req.bottleUnit, req.bottleCount, true)}</div><div className="text-xs text-slate-400">{req.manufacturer}</div></td>
 
@@ -2546,10 +2524,6 @@ export default function App() {
                   <label className="text-xs font-bold text-slate-600 mb-1 block">반출입 예정일</label>
                   <input type="date" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500" value={editingRequest.actionDate || editingRequest.date || getTodayString()} onChange={e=>setEditingRequest({...editingRequest, actionDate: e.target.value})}/>
                 </div>
-                <div>
-                  <label className="text-xs font-bold text-slate-600 mb-1 block">신청자 성명</label>
-                  <input type="text" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500" value={editingRequest.requestorName || ''} onChange={e=>setEditingRequest({...editingRequest, requestorName: e.target.value})} placeholder="성명 입력"/>
-                </div>
               </div>
               <div>
                 <label className="text-xs font-bold text-slate-600 mb-1 block">물질명</label>
@@ -2568,7 +2542,18 @@ export default function App() {
                 </div>
                 <div>
                   <label className="text-xs font-bold text-slate-600 mb-1 block">선반</label>
-                  <input type="text" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500" value={editingRequest.shelf === '미지정' ? '' : editingRequest.shelf} onChange={e=>setEditingRequest({...editingRequest, shelf: e.target.value || '미지정'})} placeholder="선반 번호"/>
+                  <input type="text" list="shelf-suggestion-list" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500" value={editingRequest.shelf === '미지정' ? '' : editingRequest.shelf} onChange={e=>setEditingRequest({...editingRequest, shelf: e.target.value || '미지정'})} placeholder="예: A 또는 A-1 입력"/>
+                  <datalist id="shelf-suggestion-list">
+                    {shelfSuggestions.map((shelf) => <option key={shelf} value={shelf} />)}
+                  </datalist>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {shelfSuggestions.length > 0 ? shelfSuggestions.slice(0, 8).map((shelf) => (
+                      <button key={shelf} type="button" onClick={() => setEditingRequest({...editingRequest, shelf})} className="px-2 py-1 rounded-full bg-blue-50 border border-blue-200 text-blue-700 text-xs font-bold hover:bg-blue-100">
+                        {shelf}
+                      </button>
+                    )) : <span className="text-[11px] text-slate-400">이 실험실에서 사용한 선반 이력이 아직 없습니다.</span>}
+                  </div>
+                  <p className="mt-1 text-[11px] text-slate-400">A처럼 일부만 입력해도 해당 실험실의 선반 후보가 자동으로 좁혀집니다.</p>
                 </div>
               </div>
               <div>
@@ -2599,20 +2584,18 @@ export default function App() {
     <>
       <div className="space-y-4">
         <div>
-          <h2 className="text-xl md:text-2xl font-bold text-slate-800 flex items-center gap-2"><History className="text-blue-600"/> 내 신청 내역</h2>
-          <p className="text-sm text-slate-500 mt-1">개인정보 보호를 위해 사용자 화면에서는 신청자 이름이 일부 마스킹되어 표시됩니다.</p>
+          <h2 className="text-xl md:text-2xl font-bold text-slate-800 flex items-center gap-2"><History className="text-blue-600"/> 신청 현황</h2>
+          <p className="text-sm text-slate-500 mt-1">연구실 사용자는 신청 내역을 삭제할 수 없으며, 변경이 필요하면 관리자에게 요청해주세요.</p>
         </div>
         <div className="bg-white rounded-xl shadow border overflow-x-auto">
-          <table className="w-full text-left text-sm whitespace-nowrap min-w-[550px]">
+          <table className="w-full text-left text-sm whitespace-nowrap min-w-[520px]">
             <thead className="bg-slate-50 border-b">
               <tr>
                   <th className="p-2 md:p-3">신청일</th>
                   <th className="p-2 md:p-3">구분</th>
-                  <th className="p-2 md:p-3">신청자</th>
                   <th className="p-2 md:p-3">저장소 / 실험실</th>
                   <th className="p-2 md:p-3">물질/수량</th>
                   <th className="p-2 md:p-3 text-center">상태</th>
-                  <th className="p-2 md:p-3 text-center">삭제</th>
               </tr>
             </thead>
             <tbody className="divide-y">
@@ -2620,10 +2603,6 @@ export default function App() {
                 <tr key={req.id} className="hover:bg-slate-50 transition">
                   <td className="p-2 md:p-3 text-xs text-slate-600">{req.date}</td>
                   <td className="p-2 md:p-3"><span className={`px-1.5 py-0.5 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{req.type === 'IN' ? '반입' : '반출'}</span></td>
-                  <td className="p-2 md:p-3 text-xs font-medium text-slate-700">
-                    {req.signature && <span title="서명있음" className="inline-block mr-1 text-green-500">✍️</span>}
-                    {maskRequestorName(req.requestorName)}
-                  </td>
                   <td className="p-2 md:p-3">
                       <div className="font-bold text-xs text-slate-700">{req.storage}</div>
                       <div className="text-xs text-slate-500">{req.labName}</div>
@@ -2637,52 +2616,13 @@ export default function App() {
                       {req.status === 'APPROVED' && <span className="px-1.5 py-0.5 bg-blue-100 text-blue-700 rounded text-xs font-bold">승인됨</span>}
                       {req.status === 'REJECTED' && <span className="px-1.5 py-0.5 bg-red-100 text-red-700 rounded text-xs font-bold">반려됨</span>}
                   </td>
-                  <td className="p-2 md:p-3 text-center">
-                      {req.status === 'PENDING' && (
-                          <button onClick={() => openDeleteNameModal(req)} className="text-red-500 p-1.5 bg-red-50 rounded hover:bg-red-100 transition" title="신청 취소/삭제"><Trash2 size={16}/></button>
-                      )}
-                  </td>
                 </tr>
               ))}
-              {requests.length === 0 && <tr><td colSpan="7" className="p-8 text-center text-slate-500">신청 내역이 없습니다.</td></tr>}
+              {requests.length === 0 && <tr><td colSpan="5" className="p-8 text-center text-slate-500">신청 내역이 없습니다.</td></tr>}
             </tbody>
           </table>
         </div>
       </div>
-
-      {deleteNameModal && (
-        <div className="fixed inset-0 bg-black/60 z-[100] flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6">
-            <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2"><AlertTriangle size={18} className="text-red-500"/> 신청 삭제 확인</h3>
-            <p className="text-sm text-slate-600 mt-3 leading-6">
-              <span className="font-bold text-slate-800">{deleteNameModal.chemicalName}</span> 신청을 삭제하려면
-              신청 시 입력한 성명을 정확히 다시 입력해주세요.
-            </p>
-            <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-600">
-              <div><span className="font-bold text-slate-800">저장소:</span> {deleteNameModal.storage}</div>
-              <div><span className="font-bold text-slate-800">실험실:</span> {deleteNameModal.labName}</div>
-              <div><span className="font-bold text-slate-800">현재 표시 이름:</span> {maskRequestorName(deleteNameModal.requestorName)}</div>
-            </div>
-            <div className="mt-4">
-              <label className="text-sm font-bold text-slate-700 block mb-2">신청 시 입력한 성명</label>
-              <input
-                type="text"
-                value={deleteNameInput}
-                onChange={(e) => setDeleteNameInput(e.target.value)}
-                className="w-full border p-3 rounded-lg focus:ring-2 focus:ring-red-500 focus:outline-none"
-                placeholder="예: 홍길동"
-                autoFocus
-                onKeyDown={(e) => e.key === 'Enter' && confirmDeleteWithName()}
-              />
-            </div>
-            <p className="mt-2 text-xs text-slate-400">오타 또는 공백이 있으면 삭제되지 않습니다.</p>
-            <div className="mt-5 flex gap-2">
-              <button onClick={confirmDeleteWithName} className="flex-1 py-3 rounded-lg bg-red-600 text-white font-bold hover:bg-red-700">이름 확인 후 삭제</button>
-              <button onClick={() => { setDeleteNameModal(null); setDeleteNameInput(''); }} className="flex-1 py-3 rounded-lg bg-slate-200 text-slate-700 font-bold hover:bg-slate-300">취소</button>
-            </div>
-          </div>
-        </div>
-      )}
     </>
   );
 
@@ -2744,7 +2684,7 @@ export default function App() {
                 <div className="ml-auto w-full md:w-auto">
                     <div className="flex gap-2 flex-wrap w-full md:w-auto">
                     <button onClick={() => {
-                        const csvHeader = "일자,구분,신청자,저장소,선반,실험실,물질명,CAS No.,성상,수량,제조사,서명\n";
+                        const csvHeader = "일자,구분,저장소,선반,실험실,물질명,CAS No.,성상,수량,제조사\n";
                         const csvData = filteredHistory.map(h => {
                             const chemInfo = chemicals.find(c => c.name === h.chemicalName) || {};
                             const casNo = h.cas && h.cas !== '-' ? h.cas : (chemInfo.cas || '-');
@@ -2752,27 +2692,22 @@ export default function App() {
                             const shelfInfo = h.shelf || '미지정';
                             // ="값" 형식으로 날짜 인식 방지, 쉼표 필드 안전 처리
                             const sT = v => `="` + String(v||'-').replace(/"/g, '""') + '"';
-                            return [sT(h.actionDate), sT(h.type==='IN'?'반입':'반출'), sT(h.requestorName||'-'), sT(h.storage), sT(shelfInfo), sT(h.labName), sT(h.chemicalName), sT(casNo), sT(chemType), sT(`${h.amount}${h.unit}`), sT(h.manufacturer), sT(h.signature ? '[서명있음]' : '-')].join(',');
+                            return [sT(h.actionDate), sT(h.type==='IN'?'반입':'반출'), sT(h.storage), sT(shelfInfo), sT(h.labName), sT(h.chemicalName), sT(casNo), sT(chemType), sT(`${h.amount}${h.unit}`), sT(h.manufacturer)].join(',');
                         }).join("\n");
                         downloadCSV(csvHeader + csvData, "history.csv");
                     }} className="flex-1 md:flex-none px-4 py-2 bg-green-600 text-white rounded font-bold flex items-center justify-center gap-2 hover:bg-green-700">
                         <Download size={16}/> CSV 다운로드
                     </button>
                     <button onClick={() => {
-                        // 서명 이미지 포함 HTML 파일 생성 (엑셀에서도 열 수 있음)
                         const rows = filteredHistory.map(h => {
                             const chemInfo = chemicals.find(c => c.name === h.chemicalName) || {};
                             const casNo = h.cas && h.cas !== '-' ? h.cas : (chemInfo.cas || '-');
                             const chemType = h.chemType || chemInfo.type || '-';
                             const shelfInfo = h.shelf || '미지정';
-                            const signCell = h.signature
-                                ? `<img src="${h.signature}" style="height:40px;max-width:120px;object-fit:contain;" alt="서명"/>`
-                                : '<span style="color:#aaa">없음</span>';
                             const esc = v => String(v||'-').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
                             return `<tr>
                                 <td>${esc(h.actionDate)}</td>
                                 <td>${esc(h.type==='IN'?'반입':'반출')}</td>
-                                <td>${esc(h.requestorName||'-')}</td>
                                 <td>${esc(h.storage)}</td>
                                 <td>${esc(shelfInfo)}</td>
                                 <td>${esc(h.labName)}</td>
@@ -2781,27 +2716,26 @@ export default function App() {
                                 <td>${esc(chemType)}</td>
                                 <td>${esc(h.amount)}${esc(h.unit)}</td>
                                 <td>${esc(h.manufacturer||'-')}</td>
-                                <td>${signCell}</td>
                             </tr>`;
                         }).join('');
                         const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/>
 <style>table{border-collapse:collapse;font-family:sans-serif;font-size:12px;}
 th,td{border:1px solid #ccc;padding:6px 10px;white-space:nowrap;}
 th{background:#f1f5f9;font-weight:bold;}</style></head><body>
-<h2 style="font-family:sans-serif">반출입 기록 조회 (서명 포함)</h2>
+<h2 style="font-family:sans-serif">반출입 기록 조회</h2>
 <table><thead><tr>
-<th>처리일자</th><th>구분</th><th>신청자</th><th>저장소</th><th>선반</th>
+<th>처리일자</th><th>구분</th><th>저장소</th><th>선반</th>
 <th>실험실</th><th>물질명</th><th>CAS No.</th><th>성상</th>
-<th>수량</th><th>제조사</th><th>서명</th>
+<th>수량</th><th>제조사</th>
 </tr></thead><tbody>${rows}</tbody></table></body></html>`;
                         const blob = new Blob([html], {type:'text/html;charset=utf-8'});
                         const url = URL.createObjectURL(blob);
                         const a = document.createElement('a');
-                        a.href = url; a.download = 'history_서명포함.html';
+                        a.href = url; a.download = 'history_상세내역.html';
                         document.body.appendChild(a); a.click();
                         document.body.removeChild(a); URL.revokeObjectURL(url);
                     }} className="flex-1 md:flex-none px-4 py-2 bg-blue-600 text-white rounded font-bold flex items-center justify-center gap-2 hover:bg-blue-700">
-                        <Download size={16}/> 서명 포함 내보내기
+                        <Download size={16}/> 상세 HTML 다운로드
                     </button>
                     </div>
                 </div>
@@ -2813,13 +2747,11 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
                         <tr>
                             <th className="p-3">처리일자</th>
                             <th className="p-3">구분</th>
-                            <th className="p-3">신청자</th>
-                            <th className="p-3">저장소 / 실험실</th>
+                                                        <th className="p-3">저장소 / 실험실</th>
                             <th className="p-3">물질명</th>
                             <th className="p-3">수량</th>
                             <th className="p-3">제조사</th>
-                            <th className="p-3 text-center">서명</th>
-                        </tr>
+                                                    </tr>
                     </thead>
                     <tbody className="divide-y">
                         {filteredHistory.map(h => {
@@ -2832,8 +2764,7 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
                                 <tr key={h.id} className="hover:bg-slate-50">
                                     <td className="p-3 text-slate-600">{h.actionDate}</td>
                                     <td className="p-3"><span className={`px-2 py-1 rounded text-xs font-bold ${h.type === 'IN' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{h.type === 'IN' ? '반입' : '반출'}</span></td>
-                                    <td className="p-3 font-medium text-slate-700">{h.requestorName || <span className="text-slate-300 text-xs">-</span>}</td>
-                                    <td className="p-3">
+                                                                        <td className="p-3">
                                         <div className="font-bold flex items-center gap-2">
                                             {h.storage}
                                             <span className="text-blue-600 text-xs bg-blue-50 px-1.5 py-0.5 rounded border border-blue-100 font-normal">
@@ -2851,12 +2782,6 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
                                     </td>
                                     <td className="p-3 font-bold text-blue-600">{h.amount}{h.unit}</td>
                                     <td className="p-3 text-slate-500">{h.manufacturer}</td>
-                                    <td className="p-3 text-center">
-                                      {h.signature
-                                        ? <button onClick={() => setSignatureViewModal(h.signature)} className="inline-flex items-center gap-1 px-2 py-1 bg-green-50 border border-green-200 text-green-700 rounded text-xs hover:bg-green-100 transition" title="서명 확인">✍️ 보기</button>
-                                        : <span className="text-slate-300 text-xs">없음</span>
-                                      }
-                                    </td>
 
                                 </tr>
                             );
@@ -2866,20 +2791,6 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
                 </table>
             </div>
         </div>
-
-        {/* 서명 확인 모달 */}
-        {signatureViewModal && (
-          <div className="fixed inset-0 bg-black/70 z-[120] flex items-center justify-center p-4" onClick={() => setSignatureViewModal(null)}>
-            <div className="bg-white rounded-2xl shadow-2xl p-5 max-w-md w-full" onClick={e => e.stopPropagation()}>
-              <h3 className="text-lg font-bold mb-3 text-slate-800 flex items-center gap-2">✍️ 서명 확인</h3>
-              <div className="border rounded-xl overflow-hidden bg-slate-50">
-                <img src={signatureViewModal} alt="서명" className="w-full object-contain" style={{maxHeight:'200px'}} />
-              </div>
-              <button onClick={() => setSignatureViewModal(null)} className="mt-4 w-full py-2.5 bg-slate-800 text-white rounded-lg font-bold hover:bg-slate-900 transition">닫기</button>
-            </div>
-          </div>
-        )}
-
 
         </>
     );

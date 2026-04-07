@@ -140,9 +140,8 @@ const analyzeShelfAllocations = (value) => {
     return { allocations, invalidLines };
 };
 
-const serializeShelfAllocations = (allocations) => Array.isArray(allocations) && allocations.length > 0
-    ? allocations.map(item => `${item.shelf}:${item.amount}`).join('\\n')
-    : '';
+// NOTE: serializeShelfAllocations helper was removed.
+// 선반 분할 데이터는 shelfAllocationRows / shelfAllocations 구조로 직접 관리합니다.
 
 const normalizeAllocationRows = (rows, fallbackShelf = '', fallbackAmount = '') => {
     if (Array.isArray(rows) && rows.length > 0) {
@@ -211,6 +210,41 @@ const getRequestShelfDisplay = (req) => {
     return req?.shelf || '미지정';
 };
 
+const buildHistoryEntriesFromRequest = (req, extraFields = {}) => {
+    const fallbackAmount = Number(req?.amount);
+    const rawAllocations = Array.isArray(req?.shelfAllocations) && req.shelfAllocations.length > 0
+        ? req.shelfAllocations
+        : [{ shelf: req?.shelf || '미지정', amount: fallbackAmount }];
+
+    const normalizedAllocations = rawAllocations
+        .map(item => ({
+            shelf: String(item?.shelf || req?.shelf || '미지정').trim() || '미지정',
+            amount: Number(item?.amount),
+        }))
+        .filter(item => Number.isFinite(item.amount) && item.amount > 0);
+
+    const historyEntries = normalizedAllocations.length > 0
+        ? normalizedAllocations
+        : [{
+            shelf: String(req?.shelf || '미지정').trim() || '미지정',
+            amount: Number.isFinite(fallbackAmount) && fallbackAmount > 0 ? fallbackAmount : 0,
+        }];
+
+    const historyGroupId = extraFields.historyGroupId || `${req?.id || 'REQ'}_${extraFields.processedAt || Date.now()}`;
+
+    return historyEntries.map((allocation, index) => ({
+        ...req,
+        ...extraFields,
+        id: extraFields.id || `${historyGroupId}_${index + 1}`,
+        shelf: allocation.shelf,
+        amount: allocation.amount,
+        shelfAllocations: [{ shelf: allocation.shelf, amount: allocation.amount }],
+        historyGroupId,
+        splitHistoryIndex: index + 1,
+        splitHistoryCount: historyEntries.length,
+    }));
+};
+
 const toEditableRequest = (req) => ({
     ...req,
     shelfAllocationRows: getEditableAllocationRows(req),
@@ -255,6 +289,63 @@ const normalizeChemicalType = (value) => {
 const getResolvedChemicalType = (item, chemicalCatalog = []) => {
     const chemical = chemicalCatalog.find(c => normalizeChemicalKey(c.name) === normalizeChemicalKey(item?.chemicalName));
     return normalizeChemicalType(item?.chemType || item?.type || chemical?.type || '') || '미지정';
+};
+
+const getManufacturerName = (value) => typeof value === 'object'
+    ? String(value?.name || '').trim()
+    : String(value || '').trim();
+
+const INVENTORY_EDIT_FIELD_LABELS = {
+    storage: '저장소',
+    labName: '실험실',
+    shelf: '선반',
+    chemicalName: '물질명',
+    manufacturer: '제조사',
+    chemType: '성상',
+    amount: '수량',
+    unit: '단위',
+};
+
+const getInventoryChangeSummary = (before = {}, after = {}) => {
+    const normalizeValue = (key, value) => {
+        if (key === 'amount') {
+            const num = Number(value);
+            return Number.isFinite(num) ? String(num) : '';
+        }
+        if (key === 'manufacturer') {
+            return normalizeChemicalKey(getManufacturerName(value));
+        }
+        if (key === 'chemType') {
+            return normalizeChemicalKey(normalizeChemicalType(value));
+        }
+        return normalizeChemicalKey(value);
+    };
+
+    return Object.entries(INVENTORY_EDIT_FIELD_LABELS)
+        .filter(([key]) => normalizeValue(key, before?.[key]) !== normalizeValue(key, after?.[key]))
+        .map(([, label]) => label);
+};
+
+const hasDuplicateInventoryRecord = (inventoryList, draft, currentId) => {
+    const normalizedDraft = {
+        storage: normalizeChemicalKey(draft?.storage),
+        labName: normalizeChemicalKey(draft?.labName),
+        shelf: normalizeChemicalKey(draft?.shelf || '미지정'),
+        chemicalName: normalizeChemicalKey(draft?.chemicalName),
+        manufacturer: normalizeChemicalKey(getManufacturerName(draft?.manufacturer)),
+        unit: normalizeChemicalKey(draft?.unit || 'L'),
+        chemType: normalizeChemicalKey(normalizeChemicalType(draft?.chemType || draft?.type || '미지정')),
+    };
+
+    return inventoryList.some((item) => item.id !== currentId && (
+        normalizeChemicalKey(item.storage) === normalizedDraft.storage &&
+        normalizeChemicalKey(item.labName) === normalizedDraft.labName &&
+        normalizeChemicalKey(item.shelf || '미지정') === normalizedDraft.shelf &&
+        normalizeChemicalKey(item.chemicalName) === normalizedDraft.chemicalName &&
+        normalizeChemicalKey(getManufacturerName(item.manufacturer)) === normalizedDraft.manufacturer &&
+        normalizeChemicalKey(item.unit || 'L') === normalizedDraft.unit &&
+        normalizeChemicalKey(normalizeChemicalType(item.chemType || item.type || '미지정')) === normalizedDraft.chemType
+    ));
 };
 
 const formatAdminDateTime = (value) => {
@@ -591,6 +682,7 @@ export default function App() {
   const [requestForm, setRequestForm] = useState({ type: 'IN', actionDate: getTodayString(), labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', bottleSize: 0, bottleUnit: '', bottleCount: '', directSize: '', directUnit: '병', directCount: '' });
   const [expandedStats, setExpandedStats] = useState({});
   const [isChemDropdownOpen, setIsChemDropdownOpen] = useState(false);
+  const [isEditChemDropdownOpen, setIsEditChemDropdownOpen] = useState(false);
   const [editingRequest, setEditingRequest] = useState(null); // 승인화면 편집 모달용
   const [bulkImportModal, setBulkImportModal] = useState(false); // 반출입 일괄 등록 모달
   const [bulkImportRows, setBulkImportRows] = useState([]); // 파싱된 일괄 등록 행
@@ -604,9 +696,10 @@ export default function App() {
   const [approvalViewTab, setApprovalViewTab] = useState('pending');
   const [uiLang, setUiLang] = useState('en');
 
-  const [invFilter, setInvFilter] = useState({ storage: 'All', labName: 'All', chemicalName: '', chemType: 'All' }); // 재고 현황 조회 필터
+  const [invFilter, setInvFilter] = useState({ storage: 'All', labName: 'All', manufacturer: 'All', chemicalName: '', chemType: 'All' }); // 재고 현황 조회 필터
   const [invSort, setInvSort] = useState({ key: 'storage', dir: 'asc' }); // 재고 현황 정렬
   const [invEditModal, setInvEditModal] = useState(null); // 재고 병/캔 단위 편집 모달
+  const [inventoryEditModal, setInventoryEditModal] = useState(null); // 재고 기본 정보 수정 모달
   const [inventoryAdjustModal, setInventoryAdjustModal] = useState(null); // 재고 불일치 즉시 보정 모달
   const [invExportIncludeSummary, setInvExportIncludeSummary] = useState(true); // CSV 요약 포함 여부
   // ✅ 물질명 검색 debounce: 매 키 입력마다 전체 배열 순회를 방지
@@ -809,9 +902,11 @@ export default function App() {
       setIsMobileMenuOpen(false);
       setApprovalViewTab('pending');
       setUiLang('en');
-      setInvFilter({ storage: 'All', labName: 'All', chemicalName: '', chemType: 'All' });
+      setIsEditChemDropdownOpen(false);
+      setInvFilter({ storage: 'All', labName: 'All', manufacturer: 'All', chemicalName: '', chemType: 'All' });
       setInvSort({ key: 'storage', dir: 'asc' });
       setInvEditModal(null);
+      setInventoryEditModal(null);
       setInventoryAdjustModal(null);
       setIsSubmitting(false);
       setRequestForm({ type: 'IN', actionDate: getTodayString(), labName: '', storage: '', ext: '', chemicalName: '', amount: '', unit: 'L', manufacturer: '', bottleSize: 0, bottleUnit: '', bottleCount: '', directSize: '', directUnit: '병', directCount: '' });
@@ -840,6 +935,10 @@ export default function App() {
           events.forEach(eventName => window.removeEventListener(eventName, markActivity));
       };
   }, [currentUser]);
+
+  useEffect(() => {
+      if (!editingRequest) setIsEditChemDropdownOpen(false);
+  }, [editingRequest]);
 
   // ── 관리자 로그인: 브루트포스 잠금 (5회 실패 → 30초 대기) ──
   const adminLoginAttemptsRef = useRef(0);
@@ -884,7 +983,7 @@ export default function App() {
 
   const handleUserEntry = () => {
       setCurrentUser('user');
-      navigateTo('request');
+      navigateTo('dashboard');
   };
 
   const applyQuickChemical = (names = []) => {
@@ -1117,9 +1216,17 @@ export default function App() {
     };
 
     if (req.inventoryLocked) {
+        const processedAt = Date.now();
+        const historyEntries = buildHistoryEntriesFromRequest(normalizedReq, {
+            actionDate: req.actionDate || getTodayString(),
+            status: 'APPROVED',
+            processedAt,
+            originalReqId: req.id,
+            inventoryUpdated: false,
+        });
         if (isDemoMode) {
             setRequests(requests.map(r => r.id === req.id ? { ...r, ...normalizedReq, status: 'APPROVED', recycledAt: null } : r));
-            setHistory([{ ...normalizedReq, status: 'APPROVED', processedAt: Date.now(), actionDate: req.actionDate || getTodayString(), inventoryUpdated: false }, ...history]);
+            setHistory([...historyEntries, ...history.filter(h => h.originalReqId !== req.id)]);
             showAlert('완료', '재고 변경 없이 승인 상태만 갱신했습니다.');
             return;
         }
@@ -1132,18 +1239,17 @@ export default function App() {
                 shelfAllocations: normalizedReq.shelfAllocations,
                 recycledAt: deleteField(),
             });
-            const histRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'history'));
-            batch.set(histRef, {
-                ...normalizedReq,
-                actionDate: req.actionDate || getTodayString(),
-                status: 'APPROVED',
-                processedAt: Date.now(),
-                originalReqId: req.id,
-                inventoryUpdated: false
+            history.filter(h => h.originalReqId === req.id).forEach(h => {
+                batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', h.id));
+            });
+            historyEntries.forEach((entry) => {
+                const histRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'history'));
+                const { id: _tempId, ...payload } = entry;
+                batch.set(histRef, payload);
             });
             await batch.commit();
             setRequests(prev => prev.map(r => r.id === req.id ? { ...r, ...normalizedReq, status: 'APPROVED', recycledAt: null } : r));
-            setHistory(prev => [{ ...normalizedReq, status: 'APPROVED', processedAt: Date.now(), actionDate: req.actionDate || getTodayString(), inventoryUpdated: false }, ...prev.filter(h => h.originalReqId !== req.id)]);
+            setHistory(prev => [...historyEntries, ...prev.filter(h => h.originalReqId !== req.id)]);
             showAlert('완료', '재고 변경 없이 승인 상태만 갱신했습니다.');
             return;
         } catch (e) {
@@ -1154,9 +1260,17 @@ export default function App() {
     }
 
     if (isDemoMode) {
+        const processedAt = Date.now();
+        const historyEntries = buildHistoryEntriesFromRequest(normalizedReq, {
+            actionDate: req.actionDate || getTodayString(),
+            status: 'APPROVED',
+            processedAt,
+            originalReqId: req.id,
+            inventoryUpdated: true,
+        });
         setInventory(nextInventory);
         setRequests(requests.map(r => r.id === req.id ? { ...r, ...normalizedReq, status: 'APPROVED', recycledAt: null } : r));
-        setHistory([{ ...normalizedReq, actionDate: req.actionDate || getTodayString(), status: 'APPROVED', processedAt: Date.now() }, ...history.filter(h => h.originalReqId !== req.id)]);
+        setHistory([...historyEntries, ...history.filter(h => h.originalReqId !== req.id)]);
         return;
     }
 
@@ -1200,20 +1314,30 @@ export default function App() {
             inventoryLocked: deleteField(),
         });
 
-        const histRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'history'));
-        batch.set(histRef, {
-            ...normalizedReq,
+        history.filter(h => h.originalReqId === req.id).forEach(h => {
+            batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', h.id));
+        });
+
+        const processedAt = Date.now();
+        const historyEntries = buildHistoryEntriesFromRequest(normalizedReq, {
             actionDate: req.actionDate || getTodayString(),
             status: 'APPROVED',
             cas: req.cas || '-',
             originalReqId: req.id,
-            processedAt: Date.now()
+            processedAt,
+            inventoryUpdated: true,
+        });
+
+        historyEntries.forEach((entry) => {
+            const histRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'history'));
+            const { id: _tempId, ...payload } = entry;
+            batch.set(histRef, payload);
         });
 
         await batch.commit();
         setInventory(nextInventory);
         setRequests(prev => prev.map(r => r.id === req.id ? { ...r, ...normalizedReq, status: 'APPROVED', recycledAt: null } : r));
-        setHistory(prev => [{ ...normalizedReq, actionDate: req.actionDate || getTodayString(), status: 'APPROVED', processedAt: Date.now() }, ...prev.filter(h => h.originalReqId !== req.id)]);
+        setHistory(prev => [...historyEntries, ...prev.filter(h => h.originalReqId !== req.id)]);
     } catch (e) {
         console.error(e);
         showAlert('오류', '처리 중 문제가 발생했습니다.');
@@ -1383,10 +1507,16 @@ export default function App() {
     const executePendingDelete = async () => {
         if (isDemoMode) {
             setRequests(requests.filter(r => r.id !== req.id));
+            setHistory(history.filter(h => h.originalReqId !== req.id));
             return;
         }
         try {
-            await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'requests', req.id));
+            const batch = writeBatch(db);
+            batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'requests', req.id));
+            history.filter(h => h.originalReqId === req.id).forEach(h => {
+                batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', h.id));
+            });
+            await batch.commit();
         } catch(e) { showAlert("오류", "삭제 실패"); }
     };
 
@@ -1519,10 +1649,11 @@ export default function App() {
         else await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'chemicals'), newChemData);
         setNewChemData({ cas: '', name: '', type: '1석유류(비)' });
     } else if (masterAddModal.type === 'manufacturer') {
-        if (!newManufacturer) return showAlert("오류", "제조사명을 입력하세요.");
-        if (manufacturers.some(m => m.name === newManufacturer)) return showAlert("오류", "이미 존재합니다.");
-        if (isDemoMode) setManufacturers([...manufacturers, { id: String(Date.now()), name: newManufacturer }]);
-        else await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'manufacturers'), { name: newManufacturer });
+        const normalizedManufacturer = getManufacturerName(newManufacturer);
+        if (!normalizedManufacturer) return showAlert("오류", "제조사명을 입력하세요.");
+        if (manufacturers.some(m => normalizeChemicalKey(getManufacturerName(m)) === normalizeChemicalKey(normalizedManufacturer))) return showAlert("오류", "이미 존재합니다.");
+        if (isDemoMode) setManufacturers([...manufacturers, { id: String(Date.now()), name: normalizedManufacturer }]);
+        else await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'manufacturers'), { name: normalizedManufacturer });
         setNewManufacturer('');
     }
     setMasterAddModal({ isOpen: false, type: '' });
@@ -1700,6 +1831,102 @@ export default function App() {
   };
 
 
+  const openInventoryEditModal = (item) => {
+    const matchedChemical = findChemicalByAnyName(item.chemicalName);
+    setInventoryEditModal({
+      ...item,
+      storage: String(item.storage || '').trim(),
+      labName: String(item.labName || '').trim(),
+      shelf: item.shelf === '미지정' ? '' : String(item.shelf || '').trim(),
+      chemicalName: getPreferredChemicalLabel(matchedChemical?.name || item.chemicalName || ''),
+      chemType: normalizeChemicalType(item.chemType || item.type || matchedChemical?.type || '') || '미지정',
+      manufacturer: getManufacturerName(item.manufacturer),
+      amount: String(item.amount ?? ''),
+      unit: String(item.unit || 'L').trim() || 'L',
+      reason: '',
+    });
+  };
+
+  const handleSaveInventoryRecordEdit = async () => {
+    if (!inventoryEditModal || isSubmitting) return;
+
+    const sourceItem = inventory.find(item => item.id === inventoryEditModal.id);
+    if (!sourceItem) {
+      showAlert('오류', '원본 재고 데이터를 찾을 수 없습니다.');
+      return;
+    }
+
+    const matchedChemical = findChemicalByAnyName(inventoryEditModal.chemicalName);
+    const normalizedAmount = Number(inventoryEditModal.amount);
+    const normalizedStorage = String(inventoryEditModal.storage || '').trim();
+    const normalizedLabName = String(inventoryEditModal.labName || '').trim();
+    const normalizedShelf = String(inventoryEditModal.shelf || '').trim() || '미지정';
+    const normalizedChemicalName = String(getPreferredChemicalLabel(matchedChemical?.name || inventoryEditModal.chemicalName || '')).trim();
+    const normalizedManufacturer = getManufacturerName(inventoryEditModal.manufacturer);
+    const normalizedUnit = String(inventoryEditModal.unit || 'L').trim() || 'L';
+    const normalizedType = normalizeChemicalType(inventoryEditModal.chemType || matchedChemical?.type || sourceItem.chemType || sourceItem.type || '') || '미지정';
+    const normalizedCas = String(matchedChemical?.cas || inventoryEditModal.cas || sourceItem.cas || '-').trim() || '-';
+    const reason = String(inventoryEditModal.reason || '').trim();
+    const bottleSize = Number(sourceItem.bottleSize || inventoryEditModal.bottleSize || 0);
+
+    if (!normalizedStorage || !normalizedLabName || !normalizedChemicalName) {
+      showAlert('오류', '저장소, 실험실, 물질명은 필수입니다.');
+      return;
+    }
+    if (!Number.isFinite(normalizedAmount) || normalizedAmount < 0) {
+      showAlert('오류', '수량은 0 이상의 숫자여야 합니다.');
+      return;
+    }
+
+    const patch = {
+      storage: normalizedStorage,
+      labName: normalizedLabName,
+      shelf: normalizedShelf,
+      chemicalName: normalizedChemicalName,
+      manufacturer: normalizedManufacturer,
+      chemType: normalizedType,
+      type: normalizedType,
+      cas: normalizedCas,
+      amount: normalizedAmount,
+      unit: normalizedUnit,
+      bottleCount: bottleSize > 0 && normalizedAmount > 0 ? String(Math.round(normalizedAmount / bottleSize)) : '',
+      lastEditedAt: Date.now(),
+      lastEditedBy: currentUser || 'admin',
+      lastEditReason: reason || '재고 정보 정정',
+    };
+
+    const changedFields = getInventoryChangeSummary(sourceItem, patch);
+    if (changedFields.length === 0) {
+      showAlert('안내', '변경된 내용이 없습니다.');
+      return;
+    }
+    if (!reason) {
+      showAlert('오류', '재고 정보 수정 사유를 입력해주세요.');
+      return;
+    }
+    if (hasDuplicateInventoryRecord(inventory, patch, inventoryEditModal.id)) {
+      showAlert('중복 경고', '동일한 저장소/실험실/선반/물질/제조사 조합의 재고가 이미 있습니다. 중복 저장을 막기 위해 수정이 차단되었습니다.');
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      if (isDemoMode) {
+        setInventory(prev => prev.map(item => item.id === inventoryEditModal.id ? { ...item, ...patch } : item));
+      } else {
+        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'inventory', inventoryEditModal.id), patch);
+        setInventory(prev => prev.map(item => item.id === inventoryEditModal.id ? { ...item, ...patch } : item));
+      }
+
+      setInventoryEditModal(null);
+      showAlert('완료', `재고 정보를 수정했습니다. (${changedFields.join(', ')})`);
+    } catch (e) {
+      showAlert('오류', '재고 정보 수정 저장 실패: ' + e.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
   const openInventoryAdjustModal = (item) => {
     const currentAmount = Number(item.amount || 0);
     setInventoryAdjustModal({
@@ -1850,6 +2077,161 @@ export default function App() {
     );
   };
 
+  const renderInventoryRecordEditModal = () => {
+    if (!inventoryEditModal) return null;
+
+    const storageOptions = Array.from(new Set([
+      ...inventory.map(item => item.storage),
+      ...labs.map(lab => lab.storage),
+      '제1공학관', '제1과학기술관', '동물실험동', '기타',
+    ].filter(Boolean))).sort((a, b) => a.localeCompare(b, 'ko'));
+    const manufacturerOptions = Array.from(new Set(manufacturers.map(getManufacturerName).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'ko'));
+    const shelfSuggestions = getSuggestedShelves(inventoryEditModal.storage, inventoryEditModal.labName, inventoryEditModal.shelf);
+    const duplicateDetected = hasDuplicateInventoryRecord(inventory, {
+      ...inventoryEditModal,
+      shelf: String(inventoryEditModal.shelf || '').trim() || '미지정',
+      manufacturer: getManufacturerName(inventoryEditModal.manufacturer),
+      chemType: normalizeChemicalType(inventoryEditModal.chemType || inventoryEditModal.type || ''),
+    }, inventoryEditModal.id);
+
+    return (
+      <div className="fixed inset-0 bg-black/55 flex items-center justify-center z-[120] p-4">
+        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl p-6 space-y-5">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h3 className="text-lg font-bold text-slate-800">재고 기본 정보 수정</h3>
+              <p className="text-sm text-slate-500 mt-1">실험실, 저장소, 선반, 제조사, 물질명 등 잘못 들어간 재고 데이터를 바로잡습니다.</p>
+            </div>
+            <button onClick={() => setInventoryEditModal(null)} className="text-slate-400 hover:text-slate-600"><X size={20}/></button>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-bold text-slate-600 mb-1.5">저장소</label>
+              <select
+                className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                value={inventoryEditModal.storage}
+                onChange={e => setInventoryEditModal(prev => ({ ...prev, storage: e.target.value }))}>
+                <option value="">저장소 선택</option>
+                {storageOptions.map(storage => <option key={storage} value={storage}>{storage}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-slate-600 mb-1.5">실험실</label>
+              <input
+                list="inventory-edit-lab-list"
+                className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                value={inventoryEditModal.labName}
+                onChange={e => setInventoryEditModal(prev => ({ ...prev, labName: e.target.value }))}
+                placeholder="실험실명 입력 또는 선택"
+              />
+              <datalist id="inventory-edit-lab-list">
+                {[...labs].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko')).map((lab) => <option key={lab.id || lab.name} value={lab.name} />)}
+              </datalist>
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-slate-600 mb-1.5">선반</label>
+              <input
+                list="inventory-edit-shelf-list"
+                className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                value={inventoryEditModal.shelf}
+                onChange={e => setInventoryEditModal(prev => ({ ...prev, shelf: e.target.value }))}
+                placeholder="미입력 시 미지정"
+              />
+              <datalist id="inventory-edit-shelf-list">
+                {shelfSuggestions.map((shelf) => <option key={shelf} value={shelf} />)}
+              </datalist>
+              {shelfSuggestions.length > 0 && <p className="mt-1 text-[11px] text-slate-400">추천 선반: {shelfSuggestions.slice(0, 6).join(', ')}</p>}
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-slate-600 mb-1.5">제조사</label>
+              <input
+                list="inventory-edit-manufacturer-list"
+                className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                value={inventoryEditModal.manufacturer}
+                onChange={e => setInventoryEditModal(prev => ({ ...prev, manufacturer: e.target.value }))}
+                placeholder="제조사 입력 또는 선택"
+              />
+              <datalist id="inventory-edit-manufacturer-list">
+                {manufacturerOptions.map((name) => <option key={name} value={name} />)}
+              </datalist>
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-slate-600 mb-1.5">물질명</label>
+              <input
+                list="inventory-edit-chemical-list"
+                className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                value={inventoryEditModal.chemicalName}
+                onChange={e => setInventoryEditModal(prev => ({ ...prev, chemicalName: e.target.value }))}
+                placeholder="한글/영문 물질명"
+              />
+              <datalist id="inventory-edit-chemical-list">
+                {[...chemicals].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko')).map((chemical) => <option key={chemical.id || chemical.name} value={chemical.name} />)}
+              </datalist>
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-slate-600 mb-1.5">성상</label>
+              <select
+                className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                value={inventoryEditModal.chemType}
+                onChange={e => setInventoryEditModal(prev => ({ ...prev, chemType: e.target.value }))}>
+                {['1석유류(비)', '1석유류(수)', '알코올류', '2석유류(비)', '2석유류(수)', '3석유류(비)', '3석유류(수)', '4석유류', '동식물유', '특수인화물', '산화성액체', '유독물질', '해당없음', '미지정'].map(type => <option key={type} value={type}>{type}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-slate-600 mb-1.5">수량</label>
+              <input
+                type="number"
+                min="0"
+                step="0.1"
+                className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                value={inventoryEditModal.amount}
+                onChange={e => setInventoryEditModal(prev => ({ ...prev, amount: e.target.value }))}
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-slate-600 mb-1.5">단위</label>
+              <input
+                className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                value={inventoryEditModal.unit || 'L'}
+                onChange={e => setInventoryEditModal(prev => ({ ...prev, unit: e.target.value }))}
+                placeholder="예: L, kg"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-bold text-slate-600 mb-1.5">수정 사유</label>
+            <textarea
+              rows={3}
+              className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+              value={inventoryEditModal.reason}
+              onChange={e => setInventoryEditModal(prev => ({ ...prev, reason: e.target.value }))}
+              placeholder="예: 잘못 등록된 실험실/제조사 정정, 저장소 위치 오기입 수정"
+            />
+          </div>
+
+          {duplicateDetected && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+              동일한 저장소/실험실/선반/물질/제조사 조합이 이미 존재합니다. 중복 행 생성을 막기 위해 현재 상태로는 저장되지 않습니다.
+            </div>
+          )}
+
+          {inventoryEditModal.lastEditedAt && (
+            <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500">
+              최근 수정: <span className="font-bold text-slate-700">{formatAdminDateTime(inventoryEditModal.lastEditedAt)}</span> · {inventoryEditModal.lastEditReason || '-'}
+            </div>
+          )}
+
+          <div className="flex gap-3 pt-1">
+            <button onClick={() => setInventoryEditModal(null)} className="flex-1 py-2.5 rounded-xl bg-slate-100 text-slate-600 font-bold hover:bg-slate-200">취소</button>
+            <button onClick={handleSaveInventoryRecordEdit} className="flex-1 py-2.5 rounded-xl bg-blue-600 text-white font-bold hover:bg-blue-700 shadow">재고 정보 저장</button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   const renderInvEditModal = () => {
     if (!invEditModal) return null;
     return (
@@ -1862,7 +2244,7 @@ export default function App() {
           <div className="bg-slate-50 rounded-lg p-3 text-sm text-slate-600">
             <div className="font-bold text-slate-800">{invEditModal.chemicalName}</div>
             <div className="text-xs text-slate-500">{invEditModal.storage} · {invEditModal.labName}</div>
-            <div className="text-xs text-slate-500 mt-1">현재 재고: <span className="font-bold text-blue-600">{invEditModal.amount}L</span></div>
+            <div className="text-xs text-slate-500 mt-1">현재 재고: <span className="font-bold text-blue-600">{invEditModal.amount}{invEditModal.unit || 'L'}</span></div>
           </div>
           <div className="space-y-3">
             <div>
@@ -1926,7 +2308,7 @@ export default function App() {
             </div>
             {invEditModal.bottleSize > 0 && (
               <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-3 text-sm text-blue-700 font-medium">
-                현재 재고: {invEditModal.amount}L ÷ {invEditModal.bottleSize}L = <span className="text-lg font-bold">{Math.round(invEditModal.amount / invEditModal.bottleSize)}{invEditModal.bottleUnit}</span>
+                현재 재고: {invEditModal.amount}{invEditModal.unit || 'L'} ÷ {invEditModal.bottleSize}{invEditModal.unit || 'L'} = <span className="text-lg font-bold">{Math.round(invEditModal.amount / invEditModal.bottleSize)}{invEditModal.bottleUnit}</span>
               </div>
             )}
           </div>
@@ -1943,12 +2325,12 @@ export default function App() {
   const renderModal = () => {
       if (!modal.isOpen) return null;
       return (
-          <div className="fixed inset-0 bg-black/60 z-[100] flex items-center justify-center p-4">
-              <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-6 animate-in zoom-in-95">
+          <div className="fixed inset-0 bg-black/45 z-[100] flex items-start justify-center p-4 pt-6 md:pt-10">
+              <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-6 animate-in zoom-in-95 border border-slate-200">
                   <h3 className={`text-xl font-bold mb-2 flex items-center gap-2 ${modal.type === 'confirm' ? 'text-orange-600' : 'text-blue-600'}`}>
                       {modal.type === 'confirm' ? <AlertTriangle size={24}/> : <Info size={24}/>} {modal.title}
                   </h3>
-                  <p className="text-slate-600 mb-6 leading-relaxed">{modal.message}</p>
+                  <p className="text-slate-600 mb-6 leading-relaxed whitespace-pre-line">{modal.message}</p>
                   <div className="flex gap-3 justify-end">
                       {modal.type === 'confirm' && <button onClick={closeModal} className="px-4 py-2 bg-slate-200 rounded-lg hover:bg-slate-300 font-medium">취소</button>}
                       <button onClick={() => { if(modal.onConfirm) modal.onConfirm(); closeModal(); }} className={`px-4 py-2 text-white rounded-lg font-medium ${modal.type === 'confirm' ? 'bg-orange-600 hover:bg-orange-700' : 'bg-blue-600 hover:bg-blue-700'}`}>확인</button>
@@ -2156,7 +2538,6 @@ export default function App() {
 
   const renderLoginScreen = () => (
     <div className="flex flex-col items-center justify-center min-h-screen bg-slate-100 p-4">
-      {renderModal()}
       {/* 공지사항 배너 (로그인 전 표시) */}
       {notices.length > 0 && (
         <div className="w-full max-w-sm mb-4 space-y-2">
@@ -2255,6 +2636,7 @@ export default function App() {
             </>
           ) : (
             <>
+              <NavItem tab="dashboard" icon={LayoutDashboard} label="대시보드" />
               <NavItem tab="request" icon={PackagePlus} label="반출/반입 신청" />
               <NavItem tab="my_requests" icon={History} label="신청 현황" />
               <NavItem tab="public_status" icon={LayoutDashboard} label="위험물 보관 현황" />
@@ -2685,15 +3067,17 @@ export default function App() {
     const allStorages = [...new Set(inventory.map(i => i.storage).filter(Boolean))].sort((a,b) => a.localeCompare(b,'ko'));
     const allLabs = [...new Set(inventory.filter(i => invFilter.storage === 'All' || i.storage === invFilter.storage).map(i => i.labName).filter(Boolean))].sort((a,b) => a.localeCompare(b,'ko'));
     const allChemTypes = [...new Set(inventory.map(i => getResolvedChemicalType(i, chemicals)).filter(Boolean))].sort((a,b) => a.localeCompare(b,'ko'));
+    const allManufacturers = [...new Set(inventory.map(i => getManufacturerName(i.manufacturer)).filter(Boolean))].sort((a,b) => a.localeCompare(b,'ko'));
 
     const filteredInv = inventory.filter(i => {
       const activeAmount = Number(i.amount) > 0;
       const matchStorage = invFilter.storage === 'All' || i.storage === invFilter.storage;
       const matchLab = invFilter.labName === 'All' || i.labName === invFilter.labName;
+      const matchManufacturer = invFilter.manufacturer === 'All' || getManufacturerName(i.manufacturer) === invFilter.manufacturer;
       const matchChemical = !chemNameDebounced || matchesChemicalKeyword(i.chemicalName, chemNameDebounced);
       const chemType = getResolvedChemicalType(i, chemicals);
       const matchType = invFilter.chemType === 'All' || chemType === invFilter.chemType;
-      return activeAmount && matchStorage && matchLab && matchChemical && matchType;
+      return activeAmount && matchStorage && matchLab && matchManufacturer && matchChemical && matchType;
     }).sort((a,b) => {
       const dir = invSort.dir === 'asc' ? 1 : -1;
       const key = invSort.key;
@@ -2707,10 +3091,10 @@ export default function App() {
 
     const toggleSort = (key) => setInvSort(prev => ({ key, dir: prev.key === key && prev.dir === 'asc' ? 'desc' : 'asc' }));
     const sortIcon = (key) => invSort.key === key ? (invSort.dir === 'asc' ? ' ▲' : ' ▼') : ' ⇅';
-    const resetInventoryFilter = () => setInvFilter({ storage: 'All', labName: 'All', chemicalName: '', chemType: 'All' });
+    const resetInventoryFilter = () => setInvFilter({ storage: 'All', labName: 'All', manufacturer: 'All', chemicalName: '', chemType: 'All' });
 
     const downloadInventoryCSV = () => {
-      const header = "저장소,실험실,선반,물질명,CAS No.,성상,수량(L),단위,병/캔정보,제조사,최근보정일,보정차이,보정사유\n";
+      const header = "저장소,실험실,선반,물질명,CAS No.,성상,수량,단위,병/캔정보,제조사,최근보정일,보정차이,보정사유,최근수정일,수정사유\n";
       const rows = filteredInv.map(i => {
         const chem = chemicals.find(c => c.name === i.chemicalName);
         const cas = (chem ? chem.cas : i.cas) || '-';
@@ -2720,8 +3104,8 @@ export default function App() {
         const bottleInfo = (i.bottleSize > 0 && i.bottleUnit && Number(i.amount) > 0)
           ? `${i.bottleCount && Number(i.bottleCount)>0 ? Number(i.bottleCount) : Math.round(Number(i.amount)/i.bottleSize)}${i.bottleUnit}(${i.amount}L)` : '-';
         return [
-          safeT(i.storage), safeT(i.labName), safeT(i.shelf||'미지정'), safeT(i.chemicalName), safeT(cas), safeT(ct), safeN(i.amount), safeT(i.unit), safeT(bottleInfo), safeT(i.manufacturer),
-          safeT(formatAdminDateTime(i.lastAdjustedAt)), safeN(i.lastAdjustedDelta ?? ''), safeT(i.lastAdjustedReason || '-')
+          safeT(i.storage), safeT(i.labName), safeT(i.shelf||'미지정'), safeT(i.chemicalName), safeT(cas), safeT(ct), safeN(i.amount), safeT(i.unit), safeT(bottleInfo), safeT(getManufacturerName(i.manufacturer)),
+          safeT(formatAdminDateTime(i.lastAdjustedAt)), safeN(i.lastAdjustedDelta ?? ''), safeT(i.lastAdjustedReason || '-'), safeT(formatAdminDateTime(i.lastEditedAt)), safeT(i.lastEditReason || '-')
         ].join(',');
       }).join("\n");
       const summary = invExportIncludeSummary
@@ -2767,7 +3151,7 @@ export default function App() {
         </div>
 
         <div className="bg-white p-4 rounded-xl shadow-sm border">
-          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-3">
             <div className="flex flex-col gap-1">
               <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">저장소</label>
               <select className="border p-2 rounded-lg bg-white text-sm focus:ring-2 focus:ring-blue-500"
@@ -2784,6 +3168,15 @@ export default function App() {
                 onChange={e => setInvFilter(f => ({...f, labName: e.target.value}))}>
                 <option value="All">전체 실험실</option>
                 {allLabs.map(l => <option key={l} value={l}>{l}</option>)}
+              </select>
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">제조사</label>
+              <select className="border p-2 rounded-lg bg-white text-sm focus:ring-2 focus:ring-blue-500"
+                value={invFilter.manufacturer}
+                onChange={e => setInvFilter(f => ({...f, manufacturer: e.target.value}))}>
+                <option value="All">전체 제조사</option>
+                {allManufacturers.map(name => <option key={name} value={name}>{name}</option>)}
               </select>
             </div>
             <div className="flex flex-col gap-1">
@@ -2851,13 +3244,25 @@ export default function App() {
                     최근 보정: {formatAdminDateTime(item.lastAdjustedAt)} · {item.lastAdjustedDelta > 0 ? '+' : ''}{item.lastAdjustedDelta || 0}{item.unit || 'L'}
                   </div>
                 )}
-                <div className="grid grid-cols-2 gap-2">
+                {item.lastEditedAt && (
+                  <div className="rounded-lg border border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                    최근 정보 수정: {formatAdminDateTime(item.lastEditedAt)} · {item.lastEditReason || '-'}
+                  </div>
+                )}
+                <div className="grid grid-cols-3 gap-2">
+                  <button
+                    onClick={() => openInventoryEditModal(item)}
+                    className="text-sm px-3 py-2 bg-violet-50 text-violet-700 border border-violet-200 rounded-lg hover:bg-violet-100 transition font-bold flex items-center justify-center gap-1"
+                    title="재고 정보 수정"
+                  >
+                    <Edit2 size={14}/> 정보 수정
+                  </button>
                   <button
                     onClick={() => setInvEditModal({ ...item })}
                     className="text-sm px-3 py-2 bg-amber-50 text-amber-700 border border-amber-200 rounded-lg hover:bg-amber-100 transition font-bold flex items-center justify-center gap-1"
                     title="병/캔 단위 설정"
                   >
-                    <Edit2 size={14}/> {item.bottleSize > 0 && item.bottleUnit ? `${item.bottleSize}L ${item.bottleUnit}` : '병/캔 설정'}
+                    <PackagePlus size={14}/> {item.bottleSize > 0 && item.bottleUnit ? `${item.bottleSize}${item.unit || 'L'} ${item.bottleUnit}` : '용기 설정'}
                   </button>
                   <button
                     onClick={() => openInventoryAdjustModal(item)}
@@ -2916,27 +3321,43 @@ export default function App() {
                         <span className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded font-medium">{ct}</span>
                       </td>
                       <td className="p-3 font-bold text-right text-blue-700 whitespace-nowrap">
-                        <div>{item.amount}L</div>
+                        <div>{item.amount}{item.unit || 'L'}</div>
                         {item.bottleSize > 0 && item.bottleUnit && <div className="text-xs text-slate-400 font-normal">{Math.round(item.amount/item.bottleSize)}{item.bottleUnit}</div>}
                       </td>
                       <td className="p-3 text-slate-500 whitespace-nowrap">{item.unit}</td>
-                      <td className="p-3 text-slate-600 whitespace-nowrap">{item.manufacturer || '-'}</td>
+                      <td className="p-3 text-slate-600 whitespace-nowrap">{getManufacturerName(item.manufacturer) || '-'}</td>
                       <td className="p-3 text-xs whitespace-nowrap">
-                        {item.lastAdjustedAt ? (
-                          <div>
-                            <div className="font-bold text-emerald-700">{formatAdminDateTime(item.lastAdjustedAt)}</div>
-                            <div className="text-slate-400">{item.lastAdjustedDelta > 0 ? '+' : ''}{item.lastAdjustedDelta || 0}{item.unit || 'L'} · {item.lastAdjustedReason || '-'}</div>
-                          </div>
-                        ) : <span className="text-slate-300">-</span>}
+                        <div className="space-y-1">
+                          {item.lastAdjustedAt ? (
+                            <div>
+                              <div className="font-bold text-emerald-700">보정 {formatAdminDateTime(item.lastAdjustedAt)}</div>
+                              <div className="text-slate-400">{item.lastAdjustedDelta > 0 ? '+' : ''}{item.lastAdjustedDelta || 0}{item.unit || 'L'} · {item.lastAdjustedReason || '-'}</div>
+                            </div>
+                          ) : null}
+                          {item.lastEditedAt ? (
+                            <div>
+                              <div className="font-bold text-amber-700">수정 {formatAdminDateTime(item.lastEditedAt)}</div>
+                              <div className="text-slate-400">{item.lastEditReason || '-'}</div>
+                            </div>
+                          ) : null}
+                          {!item.lastAdjustedAt && !item.lastEditedAt && <span className="text-slate-300">-</span>}
+                        </div>
                       </td>
                       <td className="p-3 text-center whitespace-nowrap">
                         <div className="flex items-center justify-center gap-2">
+                          <button
+                            onClick={() => openInventoryEditModal(item)}
+                            className="text-xs px-2 py-1 bg-violet-50 text-violet-700 border border-violet-200 rounded-lg hover:bg-violet-100 transition font-bold flex items-center gap-1"
+                            title="재고 정보 수정"
+                          >
+                            <Edit2 size={12}/> 정보
+                          </button>
                           <button
                             onClick={() => setInvEditModal({ ...item })}
                             className="text-xs px-2 py-1 bg-amber-50 text-amber-700 border border-amber-200 rounded-lg hover:bg-amber-100 transition font-bold flex items-center gap-1"
                             title="병/캔 단위 설정"
                           >
-                            <Edit2 size={12}/> 설정
+                            <PackagePlus size={12}/> 용기
                           </button>
                           <button
                             onClick={() => openInventoryAdjustModal(item)}
@@ -3274,10 +3695,14 @@ export default function App() {
       .sort((a, b) => String(b.actionDate || '').localeCompare(String(a.actionDate || '')) || ((b.createdAt || 0) - (a.createdAt || 0)));
     const approvedCount = requests.filter(req => req.status === 'APPROVED').length;
     const rejectedCount = requests.filter(req => req.status === 'REJECTED').length;
-    const shelfSuggestions = editingRequest
-      ? getSuggestedShelves(editingRequest.storage, editingRequest.labName, editingRequest.shelf === '미지정' ? '' : (editingRequest.shelf || ''))
-      : [];
     const allocationDraftRows = editingRequest ? getEditableAllocationRows(editingRequest) : [];
+    const allocationKeyword = allocationDraftRows.find(row => String(row.shelf || '').trim())?.shelf || (editingRequest?.shelf === '미지정' ? '' : (editingRequest?.shelf || ''));
+    const shelfSuggestions = editingRequest
+      ? getSuggestedShelves(editingRequest.storage, editingRequest.labName, allocationKeyword)
+      : [];
+    const editingFilteredChemicals = editingRequest?.chemicalName
+      ? chemicals.filter(chem => matchesChemicalKeyword(chem.name, editingRequest.chemicalName)).sort((a,b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko'))
+      : [...chemicals].sort((a,b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko'));
     const allocationDraftTotal = allocationDraftRows.reduce((sum, row) => sum + (Number(row.amount) || 0), 0);
     const allocationDraftRemaining = (Number(editingRequest?.amount) || 0) - allocationDraftTotal;
 
@@ -3416,10 +3841,12 @@ export default function App() {
 
       {/* 승인 편집 모달 */}
       {editingRequest && (
-        <div className="fixed inset-0 bg-black/60 z-[100] flex items-center justify-center p-4">
-          <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full p-6">
-            <h3 className="text-xl font-bold mb-4 text-slate-800 flex items-center gap-2"><Edit2 size={20} className="text-blue-600"/> 신청 내역 수정</h3>
-            <div className="space-y-3">
+        <div className="fixed inset-0 bg-black/60 z-[100] flex items-center justify-center p-3 md:p-4">
+          <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full max-h-[92vh] flex flex-col overflow-hidden">
+            <div className="px-5 pt-5 md:px-6 md:pt-6">
+              <h3 className="text-xl font-bold mb-4 text-slate-800 flex items-center gap-2"><Edit2 size={20} className="text-blue-600"/> 신청 내역 수정</h3>
+            </div>
+            <div className="flex-1 overflow-y-auto px-5 md:px-6 pb-4 space-y-3">
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="text-xs font-bold text-slate-600 mb-1 block">신청 유형</label>
@@ -3433,11 +3860,51 @@ export default function App() {
                   <input type="date" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500" value={editingRequest.actionDate || editingRequest.date || getTodayString()} onChange={e=>setEditingRequest({...editingRequest, actionDate: e.target.value})}/>
                 </div>
               </div>
-              <div>
+              <div className="relative">
                 <label className="text-xs font-bold text-slate-600 mb-1 block">물질명</label>
-                <input type="text" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500" value={editingRequest.chemicalName} onChange={e=>setEditingRequest({...editingRequest, chemicalName: e.target.value})}/>
+                <div className="flex gap-2">
+                  <div className="relative flex-1">
+                    <input
+                      type="text"
+                      className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500"
+                      value={editingRequest.chemicalName}
+                      onChange={e => { setEditingRequest({...editingRequest, chemicalName: e.target.value}); setIsEditChemDropdownOpen(true); }}
+                      onFocus={() => setIsEditChemDropdownOpen(true)}
+                      onBlur={() => setTimeout(() => setIsEditChemDropdownOpen(false), 200)}
+                      placeholder="예: a, acetone, 아세톤"
+                    />
+                    {isEditChemDropdownOpen && (
+                      <div className="absolute top-full left-0 right-0 bg-white border rounded-lg shadow-xl mt-1 max-h-64 overflow-y-auto z-20">
+                        {editingFilteredChemicals.length > 0 ? editingFilteredChemicals.slice(0, 12).map((chem) => (
+                          <button
+                            key={chem.id || chem.name}
+                            type="button"
+                            className="w-full text-left p-3 hover:bg-blue-50 text-sm border-b last:border-b-0 flex justify-between items-center"
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              setEditingRequest({
+                                ...editingRequest,
+                                chemicalName: getPreferredChemicalLabel(chem.name),
+                                chemType: chem.type,
+                                cas: chem.cas,
+                              });
+                              setIsEditChemDropdownOpen(false);
+                            }}
+                          >
+                            <span className="font-bold text-slate-700">{getPreferredChemicalLabel(chem.name)}</span>
+                            <span className="text-xs text-slate-400 bg-slate-100 px-2 py-0.5 rounded">{chem.type}</span>
+                          </button>
+                        )) : (
+                          <div className="p-3 text-slate-400 text-sm text-center">검색 결과가 없습니다. 직접 입력하세요.</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  <button type="button" className="bg-slate-800 text-white px-3 rounded-lg hover:bg-slate-900 flex items-center gap-1" onClick={() => setIsEditChemDropdownOpen(!isEditChemDropdownOpen)} title="물질 목록 열기"><Search size={16}/></button>
+                </div>
+                <p className="mt-1 text-[11px] text-slate-400">한글/영문 일부만 입력해도 등록된 물질명이 드롭다운으로 추천됩니다.</p>
               </div>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 <div>
                   <label className="text-xs font-bold text-slate-600 mb-1 block">수량</label>
                   <input type="number" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500" value={editingRequest.amount} onChange={e=>setEditingRequest({...editingRequest, amount: e.target.value})}/>
@@ -3447,21 +3914,6 @@ export default function App() {
                   <select className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500" value={editingRequest.unit} onChange={e=>setEditingRequest({...editingRequest, unit: e.target.value})}>
                     {['L', 'kg', 'mL', 'g', 'Can', 'Bottle'].map(u => <option key={u}>{u}</option>)}
                   </select>
-                </div>
-                <div>
-                  <label className="text-xs font-bold text-slate-600 mb-1 block">선반</label>
-                  <input type="text" list="shelf-suggestion-list" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500" value={editingRequest.shelf === '미지정' ? '' : editingRequest.shelf} onChange={e=>setEditingRequest({...editingRequest, shelf: e.target.value || '미지정'})} placeholder="예: A 또는 A-1 입력"/>
-                  <datalist id="shelf-suggestion-list">
-                    {shelfSuggestions.map((shelf) => <option key={shelf} value={shelf} />)}
-                  </datalist>
-                  <div className="mt-2 flex flex-wrap gap-1.5">
-                    {shelfSuggestions.length > 0 ? shelfSuggestions.slice(0, 8).map((shelf) => (
-                      <button key={shelf} type="button" onClick={() => setEditingRequest({...editingRequest, shelf})} className="px-2 py-1 rounded-full bg-blue-50 border border-blue-200 text-blue-700 text-xs font-bold hover:bg-blue-100">
-                        {shelf}
-                      </button>
-                    )) : <span className="text-[11px] text-slate-400">이 실험실에서 사용한 선반 이력이 아직 없습니다.</span>}
-                  </div>
-                  <p className="mt-1 text-[11px] text-slate-400">A처럼 일부만 입력해도 해당 실험실의 선반 후보가 자동으로 좁혀집니다.</p>
                 </div>
               </div>
                             {(editingRequest.type === 'IN' || editingRequest.type === 'OUT') && (
@@ -3483,7 +3935,10 @@ export default function App() {
                         type="button"
                         onClick={() => setEditingRequest({
                           ...editingRequest,
-                          shelfAllocationRows: [{ shelf: editingRequest.shelf === '미지정' ? '' : (editingRequest.shelf || ''), amount: editingRequest.amount || '' }]
+                          shelfAllocationRows: [{
+                            shelf: allocationDraftRows.find(item => String(item.shelf || '').trim())?.shelf || '',
+                            amount: editingRequest.amount || ''
+                          }]
                         })}
                         className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-slate-700 text-xs font-bold hover:bg-slate-50"
                       >
@@ -3572,9 +4027,9 @@ export default function App() {
                 </select>
               </div>
             </div>
-            <div className="flex gap-3 mt-6 justify-end">
-              <button onClick={() => setEditingRequest(null)} className="px-4 py-2 bg-slate-200 rounded-lg font-medium hover:bg-slate-300">취소</button>
-              <button onClick={() => saveEditedRequest(editingRequest)} className="px-5 py-2 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700">저장</button>
+            <div className="sticky bottom-0 bg-white border-t px-5 py-4 md:px-6 flex gap-3 justify-end pb-[calc(env(safe-area-inset-bottom)+1rem)]">
+              <button onClick={() => { setIsEditChemDropdownOpen(false); setEditingRequest(null); }} className="px-4 py-2 bg-slate-200 rounded-lg font-medium hover:bg-slate-300">취소</button>
+              <button onClick={() => { setIsEditChemDropdownOpen(false); saveEditedRequest(editingRequest); }} className="px-5 py-2 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700">저장</button>
             </div>
           </div>
         </div>
@@ -3718,7 +4173,7 @@ export default function App() {
                             const sT = v => `="` + String(v||'-').replace(/"/g, '""') + '"';
                             return [sT(h.actionDate), sT(h.type==='IN'?'반입':'반출'), sT(h.storage), sT(shelfInfo), sT(h.labName), sT(h.chemicalName), sT(casNo), sT(chemType), sT(`${h.amount}${h.unit}`), sT(h.manufacturer)].join(',');
                         }).join("\n");
-                        downloadCSV(csvHeader + csvData, "history.csv");
+                        downloadCSV(csvHeader + csvData, `history_${historyFilter.startDate || 'all'}_${historyFilter.endDate || 'all'}.csv`);
                     }} className="flex-1 md:flex-none px-4 py-2 bg-green-600 text-white rounded font-bold flex items-center justify-center gap-2 hover:bg-green-700">
                         <Download size={16}/> CSV 다운로드
                     </button>
@@ -3755,7 +4210,7 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
                         const blob = new Blob([html], {type:'text/html;charset=utf-8'});
                         const url = URL.createObjectURL(blob);
                         const a = document.createElement('a');
-                        a.href = url; a.download = 'history_상세내역.html';
+                        a.href = url; a.download = `history_${historyFilter.startDate || 'all'}_${historyFilter.endDate || 'all'}_상세내역.html`;
                         document.body.appendChild(a); a.click();
                         document.body.removeChild(a); URL.revokeObjectURL(url);
                     }} className="flex-1 md:flex-none px-4 py-2 bg-blue-600 text-white rounded font-bold flex items-center justify-center gap-2 hover:bg-blue-700">
@@ -3982,7 +4437,7 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
                                 let failCount = 0;
                                 for (const parts of rows) {
                                   const name = String(parts[0] || '').trim();
-                                  if (!name || manufacturers.some(m => m.name === name)) continue;
+                                  if (!name || manufacturers.some(m => normalizeChemicalKey(getManufacturerName(m)) === normalizeChemicalKey(name))) continue;
                                   if (isDemoMode) {
                                     setManufacturers(prev => [...prev, { id: String(Date.now() + count), name }]);
                                     count++;
@@ -4065,6 +4520,7 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
     <div className="flex h-screen bg-slate-50 font-sans text-slate-800">
       {renderModal()}
       {renderInvEditModal()}
+      {renderInventoryRecordEditModal()}
       {renderInventoryAdjustModal()}
       {renderSubmittingOverlay()}
       {!currentUser ? renderLoginScreen() : (

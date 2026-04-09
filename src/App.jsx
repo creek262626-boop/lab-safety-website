@@ -30,7 +30,7 @@ import { getAuth, signInAnonymously, onAuthStateChanged } from "firebase/auth";
  * 추가 강화: Firebase Authentication → 로그인 제공업체에서
  * "익명" 만 활성화하고 나머지는 비활성화하세요.
  */
-import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, query, writeBatch, deleteField } from "firebase/firestore";
+import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, query, writeBatch, deleteField, getDocs, where, orderBy, limit } from "firebase/firestore";
 
 // 🔴 [보안 주의] Firebase 설정값이 클라이언트 번들에 포함됩니다.
 // - Firebase API 키 자체는 공개 설계이나, Firestore Security Rules를 반드시 적용하세요.
@@ -56,6 +56,18 @@ const getTodayString = () => {
   const dd = String(date.getDate()).padStart(2, '0');
   return `${yyyy}-${mm}-${dd}`;
 };
+
+const getDateDaysAgoString = (days) => {
+  const date = new Date();
+  date.setDate(date.getDate() - Number(days || 0));
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+};
+
+const HISTORY_DEFAULT_LOOKBACK_DAYS = 90;
+const HISTORY_DEFAULT_LIMIT = 200;
 
 const normalizeName = (name) => String(name || '').trim();
 
@@ -245,6 +257,50 @@ const buildHistoryEntriesFromRequest = (req, extraFields = {}) => {
     }));
 };
 
+
+const expandHistoryEntries = (entries = []) => {
+    if (!Array.isArray(entries)) return [];
+
+    return entries.flatMap((entry, groupIndex) => {
+        const rawAllocations = Array.isArray(entry?.shelfAllocations) && entry.shelfAllocations.length > 0
+            ? entry.shelfAllocations
+            : [{ shelf: entry?.shelf || '미지정', amount: Number(entry?.amount) }];
+
+        const normalizedAllocations = rawAllocations
+            .map((allocation) => ({
+                shelf: String(allocation?.shelf || entry?.shelf || '미지정').trim() || '미지정',
+                amount: Number(allocation?.amount),
+            }))
+            .filter((allocation) => Number.isFinite(allocation.amount) && allocation.amount > 0);
+
+        if (normalizedAllocations.length === 0) {
+            return [{
+                ...entry,
+                shelf: String(entry?.shelf || '미지정').trim() || '미지정',
+                amount: Number(entry?.amount) || 0,
+                splitHistoryIndex: entry?.splitHistoryIndex || 1,
+                splitHistoryCount: entry?.splitHistoryCount || 1,
+                historyRowExpanded: false,
+            }];
+        }
+
+        const shouldExpand = normalizedAllocations.length > 1;
+        const historyGroupId = entry?.historyGroupId || entry?.originalReqId || entry?.id || `history_${groupIndex}`;
+
+        return normalizedAllocations.map((allocation, allocationIndex) => ({
+            ...entry,
+            id: shouldExpand ? `${entry?.id || historyGroupId}_${allocationIndex + 1}` : (entry?.id || `${historyGroupId}_${allocationIndex + 1}`),
+            shelf: allocation.shelf,
+            amount: allocation.amount,
+            shelfAllocations: [{ shelf: allocation.shelf, amount: allocation.amount }],
+            splitHistoryIndex: shouldExpand ? allocationIndex + 1 : (entry?.splitHistoryIndex || 1),
+            splitHistoryCount: shouldExpand ? normalizedAllocations.length : (entry?.splitHistoryCount || 1),
+            historyGroupId,
+            historyRowExpanded: shouldExpand,
+        }));
+    });
+};
+
 const toEditableRequest = (req) => ({
     ...req,
     shelfAllocationRows: getEditableAllocationRows(req),
@@ -386,6 +442,22 @@ const downloadCSV = (content, filename) => {
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
+};
+
+
+const csvEscapeText = (value) => {
+    const normalized = String(value ?? '-').replace(/\r?\n/g, ' ').replace(/"/g, '""');
+    return `"${normalized}"`;
+};
+
+const csvEscapeExcelText = (value) => {
+    const normalized = String(value ?? '-').replace(/\r?\n/g, ' ').replace(/"/g, '""');
+    return `="${normalized}"`;
+};
+
+const csvEscapeNumber = (value) => {
+    const num = Number(value);
+    return Number.isFinite(num) ? String(num) : '';
 };
 
 const EXPLANATION_COPY = {
@@ -668,7 +740,7 @@ export default function App() {
   const [requests, setRequests] = useState([]);
   const [history, setHistory] = useState([]);
 
-  const [historyFilter, setHistoryFilter] = useState({ startDate: '', endDate: '', storage: 'All', type: 'All' });
+  const [historyFilter, setHistoryFilter] = useState({ startDate: getDateDaysAgoString(HISTORY_DEFAULT_LOOKBACK_DAYS), endDate: '', storage: 'All', type: 'All' });
   const [selectedChemDetail, setSelectedChemDetail] = useState(null); 
   const [selectedLabDetail, setSelectedLabDetail] = useState(null); 
   const [masterSubTab, setMasterSubTab] = useState('labs'); 
@@ -710,6 +782,11 @@ export default function App() {
   }, [invFilter.chemicalName]);
   const legacyCleanupRef = useRef({ requests: false, history: false });
   const adminActivityRef = useRef(Date.now());
+  const staticDataLoadedRef = useRef(false);
+  const noticesLoadedRef = useRef(false);
+  const [isRealtimePaused, setIsRealtimePaused] = useState(false);
+  const [networkState, setNetworkState] = useState(typeof navigator !== 'undefined' && navigator.onLine === false ? 'offline' : 'online');
+  const [lastSyncAt, setLastSyncAt] = useState(null);
 
   const stripSensitiveRequestFields = useCallback((item) => {
     if (!item) return item;
@@ -803,75 +880,187 @@ export default function App() {
     }
   }, []);
 
-  // --- 2. Data Sync Effects ---
   useEffect(() => {
-    if (isDemoMode || !user || !db) return;
+    if (typeof document === 'undefined' || typeof window === 'undefined') return undefined;
+
+    const updateVisibility = () => setIsRealtimePaused(document.hidden);
+    const handleOnline = () => setNetworkState('online');
+    const handleOffline = () => setNetworkState('offline');
+
+    updateVisibility();
+    setNetworkState(window.navigator?.onLine === false ? 'offline' : 'online');
+
+    document.addEventListener('visibilitychange', updateVisibility);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      document.removeEventListener('visibilitychange', updateVisibility);
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  const markDataSynced = useCallback(() => setLastSyncAt(Date.now()), []);
+  const formatSyncTime = useCallback((value) => {
+    if (!value) return '-';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '-';
+    return date.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }, []);
+  const sortNoticeItems = useCallback((items) => [...items].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)), []);
+  const sortLabsByName = useCallback((items) => [...items].sort((a, b) => String(a?.name || '').localeCompare(String(b?.name || ''), 'ko', { numeric: true })), []);
+  const sortChemicalsByName = useCallback((items) => [...items].sort((a, b) => String(a?.name || '').localeCompare(String(b?.name || ''), 'ko', { numeric: true })), []);
+  const normalizeManufacturerItems = useCallback((items) => items
+    .map((item) => ({ id: item.id, name: getManufacturerName(item.name) }))
+    .filter((item) => item.name)
+    .sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko', { numeric: true })), []);
+
+  const loadNoticesOnce = useCallback(async ({ force = false } = {}) => {
+    if (isDemoMode || !user || !db || networkState === 'offline') return;
+    if (noticesLoadedRef.current && !force) return;
+    try {
+      const noticesRef = collection(db, 'artifacts', appId, 'public', 'data', 'notices');
+      const snapshot = await getDocs(noticesRef);
+      const data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
+      setNotices(sortNoticeItems(data));
+      noticesLoadedRef.current = true;
+      markDataSynced();
+    } catch (error) {
+      console.error('공지사항 1회 로드 실패', error);
+    }
+  }, [appId, db, isDemoMode, markDataSynced, networkState, sortNoticeItems, user]);
+
+  const loadStaticReferenceData = useCallback(async ({ force = false } = {}) => {
+    if (isDemoMode || !user || !db || !currentUser || networkState === 'offline') return;
+    if (staticDataLoadedRef.current && !force) return;
 
     const labsRef = collection(db, 'artifacts', appId, 'public', 'data', 'labs');
     const chemsRef = collection(db, 'artifacts', appId, 'public', 'data', 'chemicals');
     const manufRef = collection(db, 'artifacts', appId, 'public', 'data', 'manufacturers');
-    const invRef = collection(db, 'artifacts', appId, 'public', 'data', 'inventory');
-    const reqRef = collection(db, 'artifacts', appId, 'public', 'data', 'requests');
-    const histRef = collection(db, 'artifacts', appId, 'public', 'data', 'history');
 
-    const unsubLabs = onSnapshot(labsRef, async (snapshot) => {
-        const data = snapshot.docs.map(d => ({ ...d.data(), id: d.id })); 
-        if (data.length === 0 && !snapshot.metadata.fromCache) {
-            const batch = writeBatch(db);
-            SEED_LABS.forEach(item => batch.set(doc(labsRef), item));
-            await batch.commit();
-        } else {
-            setLabs(data);
-        }
-    });
+    const readCollectionOnce = async (ref, seedData = []) => {
+      let snapshot = await getDocs(ref);
+      let data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
+      if (data.length === 0 && seedData.length > 0 && !snapshot.metadata.fromCache) {
+        const batch = writeBatch(db);
+        seedData.forEach(item => batch.set(doc(ref), item));
+        await batch.commit();
+        snapshot = await getDocs(ref);
+        data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
+      }
+      return data;
+    };
 
-    const unsubChems = onSnapshot(chemsRef, async (snapshot) => {
-        const data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
-        if (data.length === 0 && !snapshot.metadata.fromCache) {
-            const batch = writeBatch(db);
-            SEED_CHEMICALS.forEach(item => batch.set(doc(chemsRef), item));
-            await batch.commit();
-        } else {
-            setChemicals(data);
-        }
-    });
+    try {
+      const [labsData, chemicalsData, manufacturersData] = await Promise.all([
+        readCollectionOnce(labsRef, SEED_LABS),
+        readCollectionOnce(chemsRef, SEED_CHEMICALS),
+        readCollectionOnce(manufRef, SEED_MANUFACTURERS),
+      ]);
 
-    const unsubManuf = onSnapshot(manufRef, async (snapshot) => {
-        const data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
-        if (data.length === 0 && !snapshot.metadata.fromCache) {
-            const batch = writeBatch(db);
-            SEED_MANUFACTURERS.forEach(item => batch.set(doc(manufRef), item));
-            await batch.commit();
-        } else {
-            setManufacturers(data.map(d => ({ id: d.id, name: d.name })));
-        }
-    });
+      setLabs(sortLabsByName(labsData));
+      setChemicals(sortChemicalsByName(chemicalsData));
+      setManufacturers(normalizeManufacturerItems(manufacturersData));
+      staticDataLoadedRef.current = true;
+      markDataSynced();
+    } catch (error) {
+      console.error('기초 데이터 1회 로드 실패', error);
+    }
+  }, [appId, currentUser, db, isDemoMode, markDataSynced, networkState, normalizeManufacturerItems, sortChemicalsByName, sortLabsByName, user]);
 
-    const unsubInv = onSnapshot(invRef, (snapshot) => {
-        setInventory(snapshot.docs.map(d => ({ ...d.data(), id: d.id })));
-    });
-    const unsubReq = onSnapshot(reqRef, (snapshot) => {
-        const data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
-        cleanupLegacyPersonalFields('requests', data);
-        setRequests(data.map(stripSensitiveRequestFields).sort((a,b) => b.createdAt - a.createdAt));
-    });
-    const unsubHist = onSnapshot(histRef, (snapshot) => {
-        const data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
-        cleanupLegacyPersonalFields('history', data);
-        setHistory(data.map(stripSensitiveRequestFields).sort((a,b) => b.processedAt - a.processedAt));
-    });
+  // --- 2. Data Sync Effects ---
+  useEffect(() => {
+    loadNoticesOnce();
+  }, [loadNoticesOnce]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    loadStaticReferenceData();
+  }, [currentUser, loadStaticReferenceData]);
+
+  useEffect(() => {
+    if (isDemoMode || !user || !db || currentUser !== 'admin' || activeTab !== 'notices') return;
+    if (networkState === 'offline' || isRealtimePaused) return;
 
     const noticesRef = collection(db, 'artifacts', appId, 'public', 'data', 'notices');
     const unsubNotices = onSnapshot(noticesRef, (snapshot) => {
-        const data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
-        setNotices(data.sort((a,b) => (b.createdAt || 0) - (a.createdAt || 0)));
+      const data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
+      setNotices(sortNoticeItems(data));
+      noticesLoadedRef.current = true;
+      markDataSynced();
     });
 
-    return () => {
-        unsubLabs(); unsubChems(); unsubManuf(); unsubInv(); unsubReq(); unsubHist(); unsubNotices();
-    };
-  }, [user, db, appId, isDemoMode, cleanupLegacyPersonalFields, stripSensitiveRequestFields]);
+    return () => unsubNotices();
+  }, [activeTab, appId, currentUser, db, isDemoMode, isRealtimePaused, markDataSynced, networkState, sortNoticeItems, user]);
 
+  useEffect(() => {
+    if (isDemoMode || !user || !db) return;
+
+    if (!currentUser) {
+      setInventory([]);
+      setRequests([]);
+      setHistory([]);
+      return;
+    }
+
+    if (networkState === 'offline' || isRealtimePaused) return;
+
+    const reqRef = collection(db, 'artifacts', appId, 'public', 'data', 'requests');
+    const unsubReq = onSnapshot(reqRef, (snapshot) => {
+      const data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
+      cleanupLegacyPersonalFields('requests', data);
+      setRequests(data.map(stripSensitiveRequestFields).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)));
+      markDataSynced();
+    });
+
+    return () => unsubReq();
+  }, [user, db, appId, isDemoMode, cleanupLegacyPersonalFields, stripSensitiveRequestFields, currentUser, networkState, isRealtimePaused, markDataSynced]);
+
+  const shouldSubscribeInventory = currentUser === 'admin'
+    ? ['dashboard', 'admin_inventory', 'approvals', 'public_status', 'safety_status'].includes(activeTab)
+    : ['request', 'public_status'].includes(activeTab);
+
+  useEffect(() => {
+    if (isDemoMode || !user || !db || !currentUser) return;
+    if (!shouldSubscribeInventory) return;
+    if (networkState === 'offline' || isRealtimePaused) return;
+
+    const invRef = collection(db, 'artifacts', appId, 'public', 'data', 'inventory');
+    const unsubInv = onSnapshot(invRef, (snapshot) => {
+      setInventory(snapshot.docs.map(d => ({ ...d.data(), id: d.id })));
+      markDataSynced();
+    });
+
+    return () => unsubInv();
+  }, [activeTab, appId, currentUser, db, isDemoMode, isRealtimePaused, markDataSynced, networkState, shouldSubscribeInventory, user]);
+
+  useEffect(() => {
+    if (isDemoMode || !user || !db || currentUser !== 'admin' || activeTab !== 'history') return;
+    if (networkState === 'offline' || isRealtimePaused) return;
+
+    const constraints = [];
+    if (historyFilter.startDate) {
+      const startMs = new Date(`${historyFilter.startDate}T00:00:00`).getTime();
+      if (Number.isFinite(startMs)) constraints.push(where('processedAt', '>=', startMs));
+    }
+    if (historyFilter.endDate) {
+      const endMs = new Date(`${historyFilter.endDate}T23:59:59.999`).getTime();
+      if (Number.isFinite(endMs)) constraints.push(where('processedAt', '<=', endMs));
+    }
+    constraints.push(orderBy('processedAt', 'desc'));
+    constraints.push(limit(HISTORY_DEFAULT_LIMIT));
+
+    const histRef = query(collection(db, 'artifacts', appId, 'public', 'data', 'history'), ...constraints);
+    const unsubHist = onSnapshot(histRef, (snapshot) => {
+      const data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
+      cleanupLegacyPersonalFields('history', data);
+      setHistory(data.map(stripSensitiveRequestFields).sort((a, b) => (b.processedAt || 0) - (a.processedAt || 0)));
+      markDataSynced();
+    });
+
+    return () => unsubHist();
+  }, [activeTab, appId, cleanupLegacyPersonalFields, currentUser, db, historyFilter.endDate, historyFilter.startDate, isDemoMode, isRealtimePaused, markDataSynced, networkState, stripSensitiveRequestFields, user]);
 
   // --- Logic Helpers ---
   const showAlert = (title, message) => setModal({ isOpen: true, type: 'info', title, message, onConfirm: null });
@@ -886,12 +1075,18 @@ export default function App() {
   useEffect(() => {
       if (currentUser === 'admin' && ['public_status', 'safety_status'].includes(activeTab)) {
           setActiveTab('dashboard');
+          return;
+      }
+      if (currentUser === 'user' && activeTab === 'dashboard') {
+          setActiveTab('request');
       }
   }, [activeTab, currentUser]);
 
   // ── 로그아웃: 모든 UI 상태 초기화 ──
   const handleLogout = () => {
       setCurrentUser(null);
+      staticDataLoadedRef.current = false;
+      noticesLoadedRef.current = false;
       setBulkImportModal(false);
       setBulkImportRows([]);
       setBulkImportErrors([]);
@@ -902,6 +1097,7 @@ export default function App() {
       setIsMobileMenuOpen(false);
       setApprovalViewTab('pending');
       setUiLang('en');
+      setHistoryFilter({ startDate: getDateDaysAgoString(HISTORY_DEFAULT_LOOKBACK_DAYS), endDate: '', storage: 'All', type: 'All' });
       setIsEditChemDropdownOpen(false);
       setInvFilter({ storage: 'All', labName: 'All', manufacturer: 'All', chemicalName: '', chemType: 'All' });
       setInvSort({ key: 'storage', dir: 'asc' });
@@ -983,7 +1179,7 @@ export default function App() {
 
   const handleUserEntry = () => {
       setCurrentUser('user');
-      navigateTo('dashboard');
+      navigateTo('request');
   };
 
   const applyQuickChemical = (names = []) => {
@@ -1347,7 +1543,7 @@ export default function App() {
   const rejectRequest = async (id) => {
       const req = requests.find(r => r.id === id);
       if (!req) return;
-      const rejectedEntry = {
+      const updatedRequest = {
           ...req,
           status: 'REJECTED',
           processedAt: Date.now(),
@@ -1355,19 +1551,24 @@ export default function App() {
           originalReqId: req.id,
       };
       if (isDemoMode) {
-          setRequests(requests.map(r => r.id === id ? { ...r, status: 'REJECTED' } : r));
-          // ✅ 반려 이력 기록 (데모 모드)
-          setHistory(prev => [rejectedEntry, ...prev]);
+          setRequests(requests.map(r => r.id === id ? updatedRequest : r));
+          setHistory(prev => prev.filter(h => h.originalReqId !== id && h.status !== 'REJECTED'));
+          showAlert('완료', '신청이 반려 처리되었으며 반출입 기록에는 반영되지 않습니다.');
           return;
       }
       try {
           const batch = writeBatch(db);
-          // ✅ requests 상태 업데이트
-          batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'requests', id), { status: 'REJECTED' });
-          // ✅ history에 반려 이력 기록 (감사 추적용)
-          const histDocRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'history'));
-          batch.set(histDocRef, rejectedEntry);
+          batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'requests', id), {
+              status: 'REJECTED',
+              processedAt: updatedRequest.processedAt,
+          });
+          history.filter(h => h.originalReqId === id).forEach(h => {
+              batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', h.id));
+          });
           await batch.commit();
+          setRequests(prev => prev.map(r => r.id === id ? updatedRequest : r));
+          setHistory(prev => prev.filter(h => h.originalReqId !== id && h.status !== 'REJECTED'));
+          showAlert('완료', '신청이 반려 처리되었으며 반출입 기록에는 반영되지 않습니다.');
       } catch (e) {
           console.error(e);
           showAlert("오류", "반려 처리 실패");
@@ -1503,11 +1704,70 @@ export default function App() {
         return;
     }
 
-    // ✅ PENDING 상태: 재고 변동이 없으므로 바로 삭제 가능
+    const rollbackAmount = Number(req.amount);
+    const rollbackAllocations = Array.isArray(req.shelfAllocations) && req.shelfAllocations.length > 0
+        ? req.shelfAllocations
+        : [{ shelf: req.shelf || '미지정', amount: rollbackAmount }];
+
+    const buildDeletedInventory = () => {
+        let nextInventory = inventory.map(item => ({ ...item, amount: Number(item.amount) }));
+        if (req.status !== 'APPROVED' || req.inventoryLocked) return nextInventory;
+
+        if (req.type === 'IN') {
+            rollbackAllocations.forEach(allocation => {
+                nextInventory = nextInventory.map(item => {
+                    if (
+                        item.storage === req.storage &&
+                        (item.shelf || '미지정') === (allocation.shelf || '미지정') &&
+                        item.chemicalName === req.chemicalName &&
+                        item.labName === req.labName &&
+                        item.manufacturer === req.manufacturer
+                    ) {
+                        return { ...item, amount: Number(item.amount) - Number(allocation.amount) };
+                    }
+                    return item;
+                }).filter(item => Number(item.amount) > 0);
+            });
+        } else {
+            rollbackAllocations.forEach(allocation => {
+                const targetIdx = nextInventory.findIndex(item =>
+                    item.storage === req.storage &&
+                    (item.shelf || '미지정') === (allocation.shelf || '미지정') &&
+                    item.chemicalName === req.chemicalName &&
+                    item.labName === req.labName
+                );
+                if (targetIdx !== -1) {
+                    nextInventory[targetIdx] = {
+                        ...nextInventory[targetIdx],
+                        amount: Number(nextInventory[targetIdx].amount) + Number(allocation.amount)
+                    };
+                } else {
+                    nextInventory.push({
+                        id: `ROLLBACK_${Date.now()}_${allocation.shelf || '미지정'}`,
+                        storage: req.storage,
+                        shelf: allocation.shelf || '미지정',
+                        chemicalName: req.chemicalName,
+                        type: req.chemType || '미지정',
+                        amount: Number(allocation.amount),
+                        unit: req.unit,
+                        manufacturer: req.manufacturer || '',
+                        labName: req.labName,
+                        cas: req.cas || '-'
+                    });
+                }
+            });
+        }
+        return nextInventory;
+    };
+
     const executePendingDelete = async () => {
+        const nextRequests = requests.filter(r => r.id !== req.id);
+        const nextHistory = history.filter(h => h.originalReqId !== req.id);
+
         if (isDemoMode) {
-            setRequests(requests.filter(r => r.id !== req.id));
-            setHistory(history.filter(h => h.originalReqId !== req.id));
+            setRequests(nextRequests);
+            setHistory(nextHistory);
+            showAlert('성공', '대기 중 신청이 삭제되었습니다.');
             return;
         }
         try {
@@ -1517,105 +1777,65 @@ export default function App() {
                 batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', h.id));
             });
             await batch.commit();
-        } catch(e) { showAlert("오류", "삭제 실패"); }
+            setRequests(nextRequests);
+            setHistory(nextHistory);
+            showAlert('성공', '대기 중 신청이 삭제되었습니다.');
+        } catch(e) {
+            console.error(e);
+            showAlert("오류", "삭제 실패");
+        }
     };
 
-    // ✅ APPROVED/REJECTED: 재고 롤백 후 완전 삭제
     const executeApprovedDelete = async () => {
+        const nextInventory = buildDeletedInventory();
+        const nextRequests = requests.filter(r => r.id !== req.id);
+        const nextHistory = history.filter(h => h.originalReqId !== req.id);
+
         if (isDemoMode) {
-            const isCheckIn_demo = req.type === 'IN';
-            const rollbackAmount = Number(req.amount);
-            let newInv = [...inventory];
-            if (isCheckIn_demo) {
-                const rollbackAllocations = Array.isArray(req.shelfAllocations) && req.shelfAllocations.length > 0
-                    ? req.shelfAllocations
-                    : [{ shelf: req.shelf || '미지정', amount: rollbackAmount }];
-                rollbackAllocations.forEach(allocation => {
-                    newInv = newInv.map(item => {
-                        if (item.storage === req.storage && (item.shelf || '미지정') === (allocation.shelf || '미지정') &&
-                            item.chemicalName === req.chemicalName && item.labName === req.labName &&
-                            item.manufacturer === req.manufacturer) {
-                            return { ...item, amount: Number(item.amount) - Number(allocation.amount) };
-                        }
-                        return item;
-                    }).filter(item => Number(item.amount) > 0);
-                });
-            } else {
-                const rollbackAllocations = Array.isArray(req.shelfAllocations) && req.shelfAllocations.length > 0
-                    ? req.shelfAllocations
-                    : [{ shelf: req.shelf || '미지정', amount: rollbackAmount }];
-                rollbackAllocations.forEach(allocation => {
-                    const targetIdx = newInv.findIndex(item =>
-                        item.storage === req.storage && (item.shelf || '미지정') === (allocation.shelf || '미지정') && item.chemicalName === req.chemicalName && item.labName === req.labName
-                    );
-                    if (targetIdx !== -1) {
-                        newInv[targetIdx] = { ...newInv[targetIdx], amount: Number(newInv[targetIdx].amount) + Number(allocation.amount) };
-                    } else {
-                        newInv.push({
-                            id: String(Date.now()), storage: req.storage, shelf: allocation.shelf || '미지정',
-                            chemicalName: req.chemicalName, type: req.chemType, amount: Number(allocation.amount),
-                            unit: req.unit, manufacturer: req.manufacturer, labName: req.labName, cas: req.cas || '-'
-                        });
-                    }
-                });
-            }
-            setInventory(newInv);
-            setRequests(requests.filter(r => r.id !== req.id));
-            setHistory(history.filter(h => h.originalReqId !== req.id));
+            setInventory(nextInventory.filter(item => Number(item.amount) > 0));
+            setRequests(nextRequests);
+            setHistory(nextHistory);
             showAlert("성공", "데이터가 롤백되어 삭제되었습니다. (데모 모드)");
             return;
         }
         try {
             const batch = writeBatch(db);
-            const isCheckIn = req.type === 'IN';
-            const amount = Number(req.amount);
             if (req.status === 'APPROVED' && !req.inventoryLocked) {
-                if (isCheckIn) {
-                    const rollbackAllocations = Array.isArray(req.shelfAllocations) && req.shelfAllocations.length > 0
-                        ? req.shelfAllocations
-                        : [{ shelf: req.shelf || '미지정', amount }];
-                    for (const allocation of rollbackAllocations) {
-                        let targetItem = inventory.find(item =>
-                            item.storage === req.storage && (item.shelf || '미지정') === (allocation.shelf || '미지정') &&
-                            item.chemicalName === req.chemicalName && item.labName === req.labName && item.manufacturer === req.manufacturer
-                        ) || inventory.find(item =>
-                            item.storage === req.storage && item.chemicalName === req.chemicalName && item.labName === req.labName
-                        );
-                        if (targetItem) {
-                            const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'inventory', targetItem.id);
-                            const newAmount = Number(targetItem.amount) - Number(allocation.amount);
-                            if (newAmount < 0) { showAlert("오류", "현재 재고가 롤백할 수량보다 적습니다."); return; }
-                            newAmount === 0 ? batch.delete(docRef) : batch.update(docRef, { amount: newAmount });
-                        } else {
-                            console.warn("[롤백] 재고 항목을 찾지 못했습니다:", req.chemicalName, req.labName, allocation.shelf);
-                        }
-                    }
-                } else {
-                    const rollbackAllocations = Array.isArray(req.shelfAllocations) && req.shelfAllocations.length > 0
-                        ? req.shelfAllocations
-                        : [{ shelf: req.shelf || '미지정', amount }];
-                    for (const allocation of rollbackAllocations) {
-                        let targetItem = inventory.find(item =>
-                            item.storage === req.storage && (item.shelf || '미지정') === (allocation.shelf || '미지정') && item.chemicalName === req.chemicalName && item.labName === req.labName
-                        );
-                        if (targetItem) {
-                            batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'inventory', targetItem.id), { amount: Number(targetItem.amount) + Number(allocation.amount) });
-                        } else {
-                            batch.set(doc(collection(db, 'artifacts', appId, 'public', 'data', 'inventory')), {
-                                storage: req.storage, shelf: allocation.shelf || '미지정', chemicalName: req.chemicalName,
-                                type: req.chemType || '미지정', amount: Number(allocation.amount), unit: req.unit,
-                                manufacturer: req.manufacturer || '', labName: req.labName, cas: req.cas || '-'
-                            });
-                        }
-                    }
-                }
+                const nextMap = new Map(nextInventory.filter(item => !String(item.id).startsWith('ROLLBACK_')).map(item => [String(item.id), Number(item.amount)]));
+
+                inventory.forEach((item) => {
+                    const currentAmount = Number(item.amount);
+                    const newAmount = nextMap.has(String(item.id)) ? Number(nextMap.get(String(item.id))) : 0;
+                    if (newAmount === currentAmount) return;
+                    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'inventory', item.id);
+                    if (newAmount <= 0) batch.delete(docRef);
+                    else batch.update(docRef, { amount: newAmount });
+                });
+
+                nextInventory.filter(item => String(item.id).startsWith('ROLLBACK_')).forEach(item => {
+                    batch.set(doc(collection(db, 'artifacts', appId, 'public', 'data', 'inventory')), {
+                        storage: item.storage,
+                        shelf: item.shelf || '미지정',
+                        chemicalName: item.chemicalName,
+                        type: item.type || '미지정',
+                        amount: Number(item.amount),
+                        unit: item.unit,
+                        manufacturer: item.manufacturer || '',
+                        labName: item.labName,
+                        cas: item.cas || '-',
+                    });
+                });
             }
+
             batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'requests', req.id));
             history.filter(h => h.originalReqId === req.id).forEach(h => {
                 batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', h.id));
             });
             await batch.commit();
-            showAlert("성공", "데이터가 롤백되어 삭제되었습니다.");
+            setInventory(nextInventory.filter(item => Number(item.amount) > 0));
+            setRequests(nextRequests);
+            setHistory(nextHistory);
+            showAlert("성공", req.inventoryLocked ? "기록이 삭제되었습니다." : "데이터가 롤백되어 삭제되었습니다.");
         } catch (e) {
             console.error(e);
             showAlert("오류", "롤백 삭제 실패");
@@ -1638,26 +1858,42 @@ export default function App() {
   };
 
   const handleSaveMasterData = async () => {
-    if (masterAddModal.type === 'lab') {
-        if (!newLabData.name) return showAlert("오류", "실험실명을 입력하세요.");
-        if (isDemoMode) setLabs([...labs, { id: String(Date.now()), ...newLabData }]);
-        else await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'labs'), newLabData);
-        setNewLabData({ name: '', loc: '', ext: '', storage: '제1공학관' });
-    } else if (masterAddModal.type === 'chemical') {
-        if (!newChemData.name) return showAlert("오류", "물질명을 입력하세요.");
-        if (isDemoMode) setChemicals([...chemicals, { id: String(Date.now()), ...newChemData }]);
-        else await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'chemicals'), newChemData);
-        setNewChemData({ cas: '', name: '', type: '1석유류(비)' });
-    } else if (masterAddModal.type === 'manufacturer') {
-        const normalizedManufacturer = getManufacturerName(newManufacturer);
-        if (!normalizedManufacturer) return showAlert("오류", "제조사명을 입력하세요.");
-        if (manufacturers.some(m => normalizeChemicalKey(getManufacturerName(m)) === normalizeChemicalKey(normalizedManufacturer))) return showAlert("오류", "이미 존재합니다.");
-        if (isDemoMode) setManufacturers([...manufacturers, { id: String(Date.now()), name: normalizedManufacturer }]);
-        else await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'manufacturers'), { name: normalizedManufacturer });
-        setNewManufacturer('');
+    try {
+      if (masterAddModal.type === 'lab') {
+          if (!newLabData.name) return showAlert("오류", "실험실명을 입력하세요.");
+          if (isDemoMode) setLabs(prev => [...prev, { id: String(Date.now()), ...newLabData }].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko', { numeric: true })));
+          else {
+              const docRef = await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'labs'), newLabData);
+              setLabs(prev => [...prev, { id: docRef.id, ...newLabData }].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko', { numeric: true })));
+              staticDataLoadedRef.current = true;
+          }
+          setNewLabData({ name: '', loc: '', ext: '', storage: '제1공학관' });
+      } else if (masterAddModal.type === 'chemical') {
+          if (!newChemData.name) return showAlert("오류", "물질명을 입력하세요.");
+          if (isDemoMode) setChemicals(prev => [...prev, { id: String(Date.now()), ...newChemData }].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko', { numeric: true })));
+          else {
+              const docRef = await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'chemicals'), newChemData);
+              setChemicals(prev => [...prev, { id: docRef.id, ...newChemData }].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko', { numeric: true })));
+              staticDataLoadedRef.current = true;
+          }
+          setNewChemData({ cas: '', name: '', type: '1석유류(비)' });
+      } else if (masterAddModal.type === 'manufacturer') {
+          const normalizedManufacturer = getManufacturerName(newManufacturer);
+          if (!normalizedManufacturer) return showAlert("오류", "제조사명을 입력하세요.");
+          if (manufacturers.some(m => normalizeChemicalKey(getManufacturerName(m)) === normalizeChemicalKey(normalizedManufacturer))) return showAlert("오류", "이미 존재합니다.");
+          if (isDemoMode) setManufacturers(prev => [...prev, { id: String(Date.now()), name: normalizedManufacturer }].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko', { numeric: true })));
+          else {
+              const docRef = await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'manufacturers'), { name: normalizedManufacturer });
+              setManufacturers(prev => [...prev, { id: docRef.id, name: normalizedManufacturer }].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko', { numeric: true })));
+              staticDataLoadedRef.current = true;
+          }
+          setNewManufacturer('');
+      }
+      setMasterAddModal({ isOpen: false, type: '' });
+      showAlert("성공", "저장되었습니다.");
+    } catch (e) {
+      showAlert("오류", "저장 실패: " + e.message);
     }
-    setMasterAddModal({ isOpen: false, type: '' });
-    showAlert("성공", "저장되었습니다.");
   };
 
   const handleDeleteMasterData = (type, idOrValue) => {
@@ -1672,6 +1908,10 @@ export default function App() {
           try {
               const colName = type === 'lab' ? 'labs' : type === 'chemical' ? 'chemicals' : 'manufacturers';
               await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', colName, idOrValue));
+              if (type === 'lab') setLabs(prev => prev.filter(l => l.id !== idOrValue));
+              if (type === 'chemical') setChemicals(prev => prev.filter(c => c.id !== idOrValue));
+              if (type === 'manufacturer') setManufacturers(prev => prev.filter(m => m.id !== idOrValue));
+              staticDataLoadedRef.current = true;
               showAlert("성공", "삭제되었습니다.");
           } catch(e) {
               showAlert("오류", "삭제 실패");
@@ -2325,7 +2565,7 @@ export default function App() {
   const renderModal = () => {
       if (!modal.isOpen) return null;
       return (
-          <div className="fixed inset-0 bg-black/45 z-[100] flex items-start justify-center p-4 pt-6 md:pt-10">
+          <div className="fixed inset-0 bg-black/45 z-[260] flex items-start justify-center p-4 pt-6 md:pt-10">
               <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-6 animate-in zoom-in-95 border border-slate-200">
                   <h3 className={`text-xl font-bold mb-2 flex items-center gap-2 ${modal.type === 'confirm' ? 'text-orange-600' : 'text-blue-600'}`}>
                       {modal.type === 'confirm' ? <AlertTriangle size={24}/> : <Info size={24}/>} {modal.title}
@@ -2615,11 +2855,20 @@ export default function App() {
               {currentUser === 'admin' ? 'Admin Mode' : 'User Mode'}
             </h2>
             <div className="flex items-center gap-1.5 mt-2 ml-1">
-                <div className={`w-2 h-2 rounded-full ${firebaseInitialized ? (isDemoMode ? 'bg-orange-500' : 'bg-green-500') : 'bg-red-500'}`}></div>
+                <div className={`w-2 h-2 rounded-full ${firebaseInitialized ? (isDemoMode ? 'bg-orange-500' : networkState === 'offline' ? 'bg-red-500' : isRealtimePaused ? 'bg-amber-400' : 'bg-green-500') : 'bg-red-500'}`}></div>
                 <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">
-                    {firebaseInitialized ? (isDemoMode ? 'Offline Demo' : 'Online') : 'Connecting...'}
+                    {firebaseInitialized ? (isDemoMode ? 'Offline Demo' : networkState === 'offline' ? 'Network Offline' : isRealtimePaused ? 'Sync Paused' : 'Realtime Sync') : 'Connecting...'}
                 </span>
             </div>
+            {!isDemoMode && currentUser && (
+              <div className="mt-1 ml-1 text-[10px] text-slate-500">
+                {networkState === 'offline'
+                  ? '네트워크 오프라인 상태입니다.'
+                  : isRealtimePaused
+                    ? '탭이 비활성화되어 실시간 연결을 잠시 끊었습니다.'
+                    : `마지막 동기화 ${formatSyncTime(lastSyncAt)}`}
+              </div>
+            )}
           </div>
           <button className="md:hidden text-slate-400 hover:text-white" onClick={() => setIsMobileMenuOpen(false)}><X size={24}/></button>
         </div>
@@ -2636,7 +2885,6 @@ export default function App() {
             </>
           ) : (
             <>
-              <NavItem tab="dashboard" icon={LayoutDashboard} label="대시보드" />
               <NavItem tab="request" icon={PackagePlus} label="반출/반입 신청" />
               <NavItem tab="my_requests" icon={History} label="신청 현황" />
               <NavItem tab="public_status" icon={LayoutDashboard} label="위험물 보관 현황" />
@@ -2697,7 +2945,7 @@ export default function App() {
                 <label className="text-sm font-bold text-slate-700">신청 유형</label>
                 <div className="flex gap-2 p-1 bg-slate-100 rounded-lg">
                     {['IN', 'OUT'].map(t => (
-                        <button key={t} onClick={() => setRequestForm({...requestForm, type: t})} className={`flex-1 py-2 rounded-md text-sm font-bold transition ${requestForm.type === t ? (t === 'IN' ? 'bg-white text-green-700 shadow-sm' : 'bg-white text-red-700 shadow-sm') : 'text-slate-400 hover:text-slate-600'}`}>
+                        <button key={t} onClick={() => setRequestForm({...requestForm, type: t})} className={`flex-1 py-2 rounded-md text-sm font-bold transition ${requestForm.type === t ? (t === 'IN' ? 'bg-green-600 text-white shadow-sm' : 'bg-red-600 text-white shadow-sm') : 'bg-white text-slate-500 hover:text-slate-700'}`}>
                             {t === 'IN' ? '반입 (입고)' : '반출 (출고)'}
                         </button>
                     ))}
@@ -3099,17 +3347,20 @@ export default function App() {
         const chem = chemicals.find(c => c.name === i.chemicalName);
         const cas = (chem ? chem.cas : i.cas) || '-';
         const ct = getResolvedChemicalType(i, chemicals);
-        const safeT = v => `="` + String(v||'-').replace(/"/g, '""') + '"';
-        const safeN = v => String(v||'-');
         const bottleInfo = (i.bottleSize > 0 && i.bottleUnit && Number(i.amount) > 0)
           ? `${i.bottleCount && Number(i.bottleCount)>0 ? Number(i.bottleCount) : Math.round(Number(i.amount)/i.bottleSize)}${i.bottleUnit}(${i.amount}L)` : '-';
         return [
-          safeT(i.storage), safeT(i.labName), safeT(i.shelf||'미지정'), safeT(i.chemicalName), safeT(cas), safeT(ct), safeN(i.amount), safeT(i.unit), safeT(bottleInfo), safeT(getManufacturerName(i.manufacturer)),
-          safeT(formatAdminDateTime(i.lastAdjustedAt)), safeN(i.lastAdjustedDelta ?? ''), safeT(i.lastAdjustedReason || '-'), safeT(formatAdminDateTime(i.lastEditedAt)), safeT(i.lastEditReason || '-')
+          csvEscapeText(i.storage), csvEscapeText(i.labName), csvEscapeText(i.shelf||'미지정'), csvEscapeText(i.chemicalName), csvEscapeExcelText(cas), csvEscapeText(ct), csvEscapeNumber(i.amount), csvEscapeText(i.unit), csvEscapeText(bottleInfo), csvEscapeText(getManufacturerName(i.manufacturer)),
+          csvEscapeText(formatAdminDateTime(i.lastAdjustedAt)), csvEscapeNumber(i.lastAdjustedDelta), csvEscapeText(i.lastAdjustedReason || '-'), csvEscapeText(formatAdminDateTime(i.lastEditedAt)), csvEscapeText(i.lastEditReason || '-')
         ].join(',');
       }).join("\n");
       const summary = invExportIncludeSummary
-        ? `\n\n요약,검색건수,${filteredInv.length}\n요약,총량(L),${filteredTotalAmount.toFixed(2)}\n요약,실험실수,${filteredLabCount}\n요약,물질수,${filteredChemCount}`
+        ? `
+
+요약,검색건수,${filteredInv.length}
+요약,총량(L),${filteredTotalAmount.toFixed(2)}
+요약,실험실수,${filteredLabCount}
+요약,물질수,${filteredChemCount}`
         : '';
       downloadCSV(header + rows + summary, `재고현황_${getTodayString()}.csv`);
     };
@@ -3664,10 +3915,12 @@ export default function App() {
       date: getTodayString(),
     };
     if (isDemoMode) {
-      setNotices(prev => [{ ...newNotice, id: String(Date.now()) }, ...prev]);
+      setNotices(prev => sortNoticeItems([{ ...newNotice, id: String(Date.now()) }, ...prev]));
     } else {
       try {
-        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'notices'), newNotice);
+        const docRef = await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'notices'), newNotice);
+        setNotices(prev => sortNoticeItems([{ ...newNotice, id: docRef.id }, ...prev]));
+        noticesLoadedRef.current = true;
       } catch(e) { showAlert('오류', '저장 실패'); return; }
     }
     setNoticeForm({ title: '', content: '', important: false });
@@ -3682,6 +3935,8 @@ export default function App() {
       }
       try {
         await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'notices', id));
+        setNotices(prev => prev.filter(n => n.id !== id));
+        noticesLoadedRef.current = true;
       } catch(e) { showAlert('오류', '삭제 실패'); }
     });
   };
@@ -3746,7 +4001,7 @@ export default function App() {
             <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="flex items-center gap-2">
-                  <span className={`px-2 py-1 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{req.type === 'IN' ? '반입' : '반출'}</span>
+                  <span className={`px-2 py-1 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-600 text-white' : 'bg-red-600 text-white'}`}>{req.type === 'IN' ? '반입' : '반출'}</span>
                   {req.inventoryLocked && <span className="px-2 py-1 rounded text-[11px] font-bold bg-amber-100 text-amber-700">재고 유지 편집</span>}
                 </div>
                 <div className="mt-2 font-bold text-slate-800">{req.chemicalName}</div>
@@ -3803,7 +4058,7 @@ export default function App() {
             ) : (
                 displayReqs.map(req => (
                 <tr key={req.id} className={req.status === 'PENDING' ? 'bg-blue-50/30' : req.status === 'APPROVED' ? 'bg-green-50/20' : 'bg-red-50/10'}>
-                    <td className="p-2 md:p-3"><span className={`px-1.5 py-0.5 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{req.type === 'IN' ? '반입' : '반출'}</span></td>
+                    <td className="p-2 md:p-3"><span className={`px-1.5 py-0.5 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-600 text-white' : 'bg-red-600 text-white'}`}>{req.type === 'IN' ? '반입' : '반출'}</span></td>
                     <td className="p-2 md:p-3 text-xs font-bold text-slate-700">{req.actionDate || req.date || '-'}</td>
                                         <td className="p-2 md:p-3"><div className="font-bold text-xs">{req.storage}</div><div className="text-xs text-slate-500">{req.labName}</div></td>
                     <td className="p-2 md:p-3 text-xs text-slate-600 font-medium">{req.ext || '-'}</td>
@@ -3904,7 +4159,7 @@ export default function App() {
                 </div>
                 <p className="mt-1 text-[11px] text-slate-400">한글/영문 일부만 입력해도 등록된 물질명이 드롭다운으로 추천됩니다.</p>
               </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="grid grid-cols-[minmax(0,2fr)_minmax(0,1fr)] gap-3">
                 <div>
                   <label className="text-xs font-bold text-slate-600 mb-1 block">수량</label>
                   <input type="number" className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500" value={editingRequest.amount} onChange={e=>setEditingRequest({...editingRequest, amount: e.target.value})}/>
@@ -3916,35 +4171,35 @@ export default function App() {
                   </select>
                 </div>
               </div>
-                            {(editingRequest.type === 'IN' || editingRequest.type === 'OUT') && (
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-bold text-slate-600 mb-1 block">성상(물질 유형)</label>
+                  <select className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500" value={editingRequest.chemType || ''} onChange={e=>setEditingRequest({...editingRequest, chemType: e.target.value})}>
+                    {['1석유류(비)', '1석유류(수)', '알코올류', '2석유류(비)', '2석유류(수)', '3석유류(비)', '3석유류(수)', '4석유류', '동식물유', '특수인화물', '유독물질', '해당없음'].map(t => <option key={t} value={t}>{t}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs font-bold text-slate-600 mb-1 block">제조사</label>
+                  <select className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500" value={editingRequest.manufacturer} onChange={e=>setEditingRequest({...editingRequest, manufacturer: e.target.value})}>
+                    <option value="">선택</option>
+                    {[...manufacturers].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko')).map((m) => <option key={m.id || m.name} value={m.name}>{m.name}</option>)}
+                  </select>
+                </div>
+              </div>
+              {(editingRequest.type === 'IN' || editingRequest.type === 'OUT') && (
                 <div className="rounded-xl border border-blue-100 bg-blue-50/60 p-3 space-y-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <label className="text-xs font-bold text-slate-700">선반별 {editingRequest.type === 'IN' ? '보관' : '출고'} 배치</label>
-                    <div className="flex flex-wrap gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setEditingRequest({
-                          ...editingRequest,
-                          shelfAllocationRows: [...allocationDraftRows, { shelf: '', amount: '' }]
-                        })}
-                        className="px-2.5 py-1 rounded-lg border border-blue-200 bg-white text-blue-700 text-xs font-bold hover:bg-blue-50"
-                      >
-                        + 선반 추가
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setEditingRequest({
-                          ...editingRequest,
-                          shelfAllocationRows: [{
-                            shelf: allocationDraftRows.find(item => String(item.shelf || '').trim())?.shelf || '',
-                            amount: editingRequest.amount || ''
-                          }]
-                        })}
-                        className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-slate-700 text-xs font-bold hover:bg-slate-50"
-                      >
-                        단일 선반
-                      </button>
-                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setEditingRequest({
+                        ...editingRequest,
+                        shelfAllocationRows: [...allocationDraftRows, { shelf: '', amount: '' }]
+                      })}
+                      className="px-2.5 py-1 rounded-lg border border-blue-200 bg-white text-blue-700 text-xs font-bold hover:bg-blue-50"
+                    >
+                      + 선반 추가
+                    </button>
                   </div>
 
                   <div className="space-y-2">
@@ -3985,22 +4240,26 @@ export default function App() {
                   </div>
 
                   <div className="flex flex-wrap gap-1.5">
-                    {shelfSuggestions.length > 0 ? shelfSuggestions.slice(0, 8).map((shelf) => (
-                      <button
-                        key={shelf}
-                        type="button"
-                        onClick={() => {
-                          const rows = [...allocationDraftRows];
-                          const targetIndex = rows.findIndex(item => !String(item.shelf || '').trim());
-                          if (targetIndex >= 0) rows[targetIndex] = { ...rows[targetIndex], shelf };
-                          else rows.push({ shelf, amount: '' });
-                          setEditingRequest({ ...editingRequest, shelfAllocationRows: rows });
-                        }}
-                        className="px-2 py-1 rounded-full bg-white border border-blue-200 text-blue-700 text-xs font-bold hover:bg-blue-100"
-                      >
-                        {shelf}
-                      </button>
-                    )) : <span className="text-[11px] text-slate-400">선반 제안이 없으면 직접 입력하세요.</span>}
+                    {shelfSuggestions.length > 0 ? shelfSuggestions.slice(0, 8).map((shelf) => {
+                      const selectedSingleShelf = allocationDraftRows.length === 1 ? String(allocationDraftRows[0]?.shelf || '').trim() : '';
+                      const isSelected = selectedSingleShelf === shelf;
+                      return (
+                        <button
+                          key={shelf}
+                          type="button"
+                          onClick={() => setEditingRequest({
+                            ...editingRequest,
+                            shelfAllocationRows: [{
+                              shelf,
+                              amount: editingRequest.amount || allocationDraftRows.find(item => Number(item.amount) > 0)?.amount || ''
+                            }]
+                          })}
+                          className={`px-2 py-1 rounded-full border text-xs font-bold transition ${isSelected ? 'bg-blue-600 border-blue-600 text-white' : 'bg-white border-blue-200 text-blue-700 hover:bg-blue-100'}`}
+                        >
+                          {shelf}
+                        </button>
+                      );
+                    }) : <span className="text-[11px] text-slate-400">선반 제안이 없으면 직접 입력하거나 + 선반 추가로 행을 더해 주세요.</span>}
                   </div>
 
                   <div className="flex flex-wrap gap-3 text-[11px] font-medium">
@@ -4009,23 +4268,9 @@ export default function App() {
                       남은 수량: {allocationDraftRemaining}{editingRequest.unit || 'L'}
                     </span>
                   </div>
-                  <p className="text-[11px] text-slate-500">반입/반출 모두 선반별로 나눠 입력할 수 있습니다. 합계가 총 수량과 같아야 승인됩니다.</p>
+                  <p className="text-[11px] text-slate-500">퀵 버튼은 단일 선반 선택용입니다. 다른 선반을 추가하려면 + 선반 추가를 눌러 직접 입력하세요.</p>
                 </div>
               )}
-
-              <div>
-                <label className="text-xs font-bold text-slate-600 mb-1 block">성상(물질 유형)</label>
-                <select className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500" value={editingRequest.chemType || ''} onChange={e=>setEditingRequest({...editingRequest, chemType: e.target.value})}>
-                  {['1석유류(비)', '1석유류(수)', '알코올류', '2석유류(비)', '2석유류(수)', '3석유류(비)', '3석유류(수)', '4석유류', '동식물유', '특수인화물', '유독물질', '해당없음'].map(t => <option key={t} value={t}>{t}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="text-xs font-bold text-slate-600 mb-1 block">제조사</label>
-                <select className="w-full border p-2 rounded focus:ring-2 focus:ring-blue-500" value={editingRequest.manufacturer} onChange={e=>setEditingRequest({...editingRequest, manufacturer: e.target.value})}>
-                  <option value="">선택</option>
-                  {[...manufacturers].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko')).map((m) => <option key={m.id || m.name} value={m.name}>{m.name}</option>)}
-                </select>
-              </div>
             </div>
             <div className="sticky bottom-0 bg-white border-t px-5 py-4 md:px-6 flex gap-3 justify-end pb-[calc(env(safe-area-inset-bottom)+1rem)]">
               <button onClick={() => { setIsEditChemDropdownOpen(false); setEditingRequest(null); }} className="px-4 py-2 bg-slate-200 rounded-lg font-medium hover:bg-slate-300">취소</button>
@@ -4053,7 +4298,7 @@ export default function App() {
                   <div className="font-bold text-slate-800">{req.chemicalName}</div>
                   <div className="text-xs text-slate-500 mt-1">{req.storage} · {req.labName}</div>
                 </div>
-                <span className={`px-1.5 py-0.5 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{req.type === 'IN' ? '반입' : '반출'}</span>
+                <span className={`px-1.5 py-0.5 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-600 text-white' : 'bg-red-600 text-white'}`}>{req.type === 'IN' ? '반입' : '반출'}</span>
               </div>
               <div className="grid grid-cols-2 gap-2 text-sm">
                 <div className="rounded-lg bg-slate-50 p-2"><div className="text-[11px] text-slate-400">신청일</div><div className="text-slate-700">{req.actionDate || req.date || '-'}</div></div>
@@ -4080,7 +4325,7 @@ export default function App() {
               {requests.map(req => (
                 <tr key={req.id} className="hover:bg-slate-50 transition">
                   <td className="p-2 md:p-3 text-xs text-slate-600">{req.actionDate || req.date}</td>
-                  <td className="p-2 md:p-3"><span className={`px-1.5 py-0.5 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{req.type === 'IN' ? '반입' : '반출'}</span></td>
+                  <td className="p-2 md:p-3"><span className={`px-1.5 py-0.5 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-600 text-white' : 'bg-red-600 text-white'}`}>{req.type === 'IN' ? '반입' : '반출'}</span></td>
                   <td className="p-2 md:p-3">
                       <div className="font-bold text-xs text-slate-700">{req.storage}</div>
                       <div className="text-xs text-slate-500">{req.labName}</div>
@@ -4105,25 +4350,64 @@ export default function App() {
   );
 
   const renderHistoryScreen = () => {
-    const filteredHistory = history.filter(h => {
+    const expandedHistory = expandHistoryEntries(history)
+        .filter(h => h.status !== 'REJECTED')
+        .sort((a, b) => {
+            const dateCompare = String(b.actionDate || '').localeCompare(String(a.actionDate || ''));
+            if (dateCompare !== 0) return dateCompare;
+            return (Number(b.processedAt) || 0) - (Number(a.processedAt) || 0);
+        });
+
+    const filteredHistory = expandedHistory.filter(h => {
         if (historyFilter.type !== 'All' && h.type !== historyFilter.type) return false;
         if (historyFilter.storage !== 'All' && h.storage !== historyFilter.storage) return false;
-        
-        // [수정] 날짜 범위 필터링 로직
-        // 시작일이 설정되어 있고, 기록 날짜가 시작일보다 전이면 제외
         if (historyFilter.startDate && h.actionDate < historyFilter.startDate) return false;
-        // 종료일이 설정되어 있고, 기록 날짜가 종료일보다 후면 제외
         if (historyFilter.endDate && h.actionDate > historyFilter.endDate) return false;
-        
         return true;
     });
+
+    const totalInAmount = filteredHistory
+        .filter(h => h.type === 'IN')
+        .reduce((sum, h) => sum + (Number(h.amount) || 0), 0);
+    const totalOutAmount = filteredHistory
+        .filter(h => h.type === 'OUT')
+        .reduce((sum, h) => sum + (Number(h.amount) || 0), 0);
+    const splitRowCount = filteredHistory.filter(h => (h.splitHistoryCount || 1) > 1).length;
+    const groupedSplitCount = new Set(filteredHistory.filter(h => (h.splitHistoryCount || 1) > 1).map(h => h.historyGroupId || h.originalReqId || h.id)).size;
 
     return (
         <>
         <div className="space-y-4">
             <h2 className="text-xl md:text-2xl font-bold text-slate-800 flex items-center gap-2"><ArrowRightLeft className="text-blue-600"/> 반출입 기록 조회</h2>
+
+            <div className="rounded-2xl border border-blue-100 bg-blue-50 px-4 py-3 text-sm text-blue-800">
+                여러 선반으로 승인된 기록은 이제 <strong>선반별 개별 행</strong>으로 분리해서 보여주고, CSV/HTML 다운로드도 같은 구조로 내보냅니다.<br />기본 조회 범위는 <strong>최근 90일</strong>이며, 실시간 조회는 <strong>최대 200건</strong>으로 제한해 Firestore 읽기량을 줄였습니다.
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+                <div className="rounded-xl border border-slate-200 bg-white p-4">
+                    <div className="text-xs font-bold text-slate-500">조회 건수</div>
+                    <div className="mt-1 text-2xl font-bold text-slate-800">{filteredHistory.length}</div>
+                    <div className="mt-1 text-xs text-slate-400">현재 필터 기준 표시 행 수</div>
+                </div>
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4">
+                    <div className="text-xs font-bold text-emerald-700">반입 합계</div>
+                    <div className="mt-1 text-2xl font-bold text-emerald-700">{totalInAmount.toFixed(2)}</div>
+                    <div className="mt-1 text-xs text-emerald-600">숫자 형식으로 CSV 내보내기 지원</div>
+                </div>
+                <div className="rounded-xl border border-rose-200 bg-rose-50 p-4">
+                    <div className="text-xs font-bold text-rose-700">반출 합계</div>
+                    <div className="mt-1 text-2xl font-bold text-rose-700">{totalOutAmount.toFixed(2)}</div>
+                    <div className="mt-1 text-xs text-rose-600">엑셀 계산용 드래그/합산에 맞춘 수량 열</div>
+                </div>
+                <div className="rounded-xl border border-blue-200 bg-blue-50 p-4">
+                    <div className="text-xs font-bold text-blue-700">분할 선반 행</div>
+                    <div className="mt-1 text-2xl font-bold text-blue-700">{splitRowCount}</div>
+                    <div className="mt-1 text-xs text-blue-600">분할 승인 묶음 {groupedSplitCount}건</div>
+                </div>
+            </div>
+
             <div className="bg-white p-4 rounded-xl shadow-sm border flex flex-wrap gap-3 items-center">
-                {/* [수정] 날짜 범위 선택 필터 UI */}
                 <div className="flex items-center gap-2 border p-2 rounded bg-slate-50">
                     <span className="text-sm font-bold text-slate-600 hidden sm:inline">기간:</span>
                     <input 
@@ -4143,9 +4427,9 @@ export default function App() {
                     />
                     {(historyFilter.startDate || historyFilter.endDate) && (
                         <button 
-                            onClick={() => setHistoryFilter({...historyFilter, startDate: '', endDate: ''})} 
+                            onClick={() => setHistoryFilter({...historyFilter, startDate: getDateDaysAgoString(HISTORY_DEFAULT_LOOKBACK_DAYS), endDate: ''})} 
                             className="ml-1 text-slate-400 hover:text-red-500 transition"
-                            title="날짜 초기화"
+                            title="최근 90일 기본값으로 복원"
                         >
                             <X size={16} />
                         </button>
@@ -4157,7 +4441,6 @@ export default function App() {
                 </select>
                 <select className="border p-2 rounded focus:ring-2 focus:ring-blue-500" value={historyFilter.storage} onChange={e => setHistoryFilter({...historyFilter, storage: e.target.value})}>
                     <option value="All">전체 저장소</option>
-                    {/* ✅ 하드코딩 제거: history 데이터에서 동적으로 저장소 목록 추출 */}
                     {[...new Set(history.map(h => h.storage).filter(Boolean))].sort().map(s => <option key={s} value={s}>{s}</option>)}
                 </select>
                 <div className="ml-auto w-full md:w-auto">
@@ -4169,9 +4452,18 @@ export default function App() {
                             const casNo = h.cas && h.cas !== '-' ? h.cas : (chemInfo.cas || '-');
                             const chemType = normalizeChemicalType(h.chemType || chemInfo.type || '-') || '-';
                             const shelfInfo = h.shelf || '미지정';
-                            // ="값" 형식으로 날짜 인식 방지, 쉼표 필드 안전 처리
-                            const sT = v => `="` + String(v||'-').replace(/"/g, '""') + '"';
-                            return [sT(h.actionDate), sT(h.type==='IN'?'반입':'반출'), sT(h.storage), sT(shelfInfo), sT(h.labName), sT(h.chemicalName), sT(casNo), sT(chemType), sT(`${h.amount}${h.unit}`), sT(h.manufacturer)].join(',');
+                            return [
+                                csvEscapeText(h.actionDate),
+                                csvEscapeText(h.type==='IN'?'반입':'반출'),
+                                csvEscapeText(h.storage),
+                                csvEscapeText(shelfInfo),
+                                csvEscapeText(h.labName),
+                                csvEscapeText(h.chemicalName),
+                                csvEscapeExcelText(casNo),
+                                csvEscapeText(chemType),
+                                csvEscapeNumber(h.amount),
+                                csvEscapeText(h.manufacturer)
+                            ].join(',');
                         }).join("\n");
                         downloadCSV(csvHeader + csvData, `history_${historyFilter.startDate || 'all'}_${historyFilter.endDate || 'all'}.csv`);
                     }} className="flex-1 md:flex-none px-4 py-2 bg-green-600 text-white rounded font-bold flex items-center justify-center gap-2 hover:bg-green-700">
@@ -4193,7 +4485,8 @@ export default function App() {
                                 <td>${esc(h.chemicalName)}</td>
                                 <td>${esc(casNo)}</td>
                                 <td>${esc(chemType)}</td>
-                                <td>${esc(h.amount)}${esc(h.unit)}</td>
+                                <td>${esc(h.amount)}</td>
+                                <td>${esc(h.unit)}</td>
                                 <td>${esc(h.manufacturer||'-')}</td>
                             </tr>`;
                         }).join('');
@@ -4205,7 +4498,7 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
 <table><thead><tr>
 <th>처리일자</th><th>구분</th><th>저장소</th><th>선반</th>
 <th>실험실</th><th>물질명</th><th>CAS No.</th><th>성상</th>
-<th>수량</th><th>제조사</th>
+<th>수량</th><th>단위</th><th>제조사</th>
 </tr></thead><tbody>${rows}</tbody></table></body></html>`;
                         const blob = new Blob([html], {type:'text/html;charset=utf-8'});
                         const url = URL.createObjectURL(blob);
@@ -4230,7 +4523,10 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
                         <div key={h.id} className="bg-white rounded-xl border shadow-sm p-4 space-y-3">
                             <div className="flex items-start justify-between gap-3">
                                 <div>
-                                    <div className="font-bold text-slate-800">{h.chemicalName}</div>
+                                    <div className="font-bold text-slate-800 flex items-center gap-2 flex-wrap">
+                                        <span>{h.chemicalName}</span>
+                                        {(h.splitHistoryCount || 1) > 1 && <span className="text-[11px] px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-100">분할 {h.splitHistoryIndex}/{h.splitHistoryCount}</span>}
+                                    </div>
                                     <div className="text-xs text-slate-500 mt-1">{h.storage} · {h.labName}</div>
                                 </div>
                                 <span className={`px-2 py-1 rounded text-xs font-bold ${h.type === 'IN' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{h.type === 'IN' ? '반입' : '반출'}</span>
@@ -4249,16 +4545,18 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
             </div>
 
             <div className="hidden md:block bg-white rounded-xl shadow border overflow-x-auto">
-                <table className="w-full text-left text-sm whitespace-nowrap min-w-[800px]">
+                <table className="w-full text-left text-sm whitespace-nowrap min-w-[1100px]">
                     <thead className="bg-slate-50 border-b">
                         <tr>
                             <th className="p-3">처리일자</th>
                             <th className="p-3">구분</th>
-                                                        <th className="p-3">저장소 / 실험실</th>
-                            <th className="p-3">물질명</th>
-                            <th className="p-3">수량</th>
+                            <th className="p-3">저장소</th>
+                            <th className="p-3">실험실</th>
+                            <th className="p-3">선반</th>
+                            <th className="p-3">물질명 / 세부정보</th>
+                            <th className="p-3 text-right">수량</th>
                             <th className="p-3">제조사</th>
-                                                    </tr>
+                        </tr>
                     </thead>
                     <tbody className="divide-y">
                         {filteredHistory.map(h => {
@@ -4271,29 +4569,25 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
                                 <tr key={h.id} className="hover:bg-slate-50">
                                     <td className="p-3 text-slate-600">{h.actionDate}</td>
                                     <td className="p-3"><span className={`px-2 py-1 rounded text-xs font-bold ${h.type === 'IN' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{h.type === 'IN' ? '반입' : '반출'}</span></td>
-                                                                        <td className="p-3">
-                                        <div className="font-bold flex items-center gap-2">
-                                            {h.storage}
-                                            <span className="text-blue-600 text-xs bg-blue-50 px-1.5 py-0.5 rounded border border-blue-100 font-normal">
-                                                선반: {shelfInfo}
-                                            </span>
-                                        </div>
-                                        <div className="text-xs text-slate-500 mt-0.5">{h.labName}</div>
+                                    <td className="p-3 font-medium text-slate-800">{h.storage}</td>
+                                    <td className="p-3 text-slate-600">{h.labName}</td>
+                                    <td className="p-3">
+                                        <div className="font-bold text-blue-700">{shelfInfo}</div>
+                                        {(h.splitHistoryCount || 1) > 1 && <div className="mt-1 text-[11px] text-blue-600">분할 {h.splitHistoryIndex}/{h.splitHistoryCount}</div>}
                                     </td>
                                     <td className="p-3">
                                         <div className="font-medium text-slate-800">{h.chemicalName}</div>
-                                        <div className="text-xs text-slate-500 mt-1 flex items-center gap-1.5">
+                                        <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-500">
                                             <span className="bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200">CAS: {casNo}</span>
                                             <span className="bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200">{chemType}</span>
                                         </div>
                                     </td>
-                                    <td className="p-3 font-bold text-blue-600">{h.amount}{h.unit}</td>
+                                    <td className="p-3 text-right font-bold text-blue-600">{h.amount}{h.unit}</td>
                                     <td className="p-3 text-slate-500">{h.manufacturer}</td>
-
                                 </tr>
                             );
                         })}
-                        {filteredHistory.length === 0 && <tr><td colSpan="6" className="p-8 text-center text-slate-500">기록이 없습니다.</td></tr>}
+                        {filteredHistory.length === 0 && <tr><td colSpan="8" className="p-8 text-center text-slate-500">기록이 없습니다.</td></tr>}
                     </tbody>
                 </table>
             </div>
@@ -4337,6 +4631,7 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
                             else { try { await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'labs'), labData); } catch(err) { console.error(err); } }
                             count++;
                           }
+                          if (!isDemoMode) await loadStaticReferenceData({ force: true });
                           showAlert("완료", `실험실 ${count}건이 업로드되었습니다.`);
                         } catch(err) { showAlert("오류", "파일 읽기 실패: " + err.message); }
                         e.target.value = '';
@@ -4388,6 +4683,7 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
                             else { try { await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'chemicals'), chemData); } catch(err) { console.error(err); } }
                             count++;
                           }
+                          if (!isDemoMode) await loadStaticReferenceData({ force: true });
                           showAlert("완료", `위험물 ${count}건이 업로드되었습니다.`);
                         } catch(err) { showAlert("오류", "파일 읽기 실패: " + err.message); }
                         e.target.value = '';
@@ -4452,6 +4748,7 @@ th{background:#f1f5f9;font-weight:bold;}</style></head><body>
                                     }
                                   }
                                 }
+                                if (!isDemoMode) await loadStaticReferenceData({ force: true });
                                 if (failCount > 0) {
                                   showAlert("완료 (일부 실패)", `제조사 ${count}건 업로드 완료, ${failCount}건 실패`);
                                 } else {

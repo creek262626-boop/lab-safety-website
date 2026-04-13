@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { 
   PackagePlus, PackageMinus, Settings, Download, Users, ShieldAlert, 
   CheckCircle, XCircle, Trash2, Database, ArrowRightLeft, LayoutDashboard, 
@@ -30,7 +30,7 @@ import { getAuth, signInAnonymously, onAuthStateChanged } from "firebase/auth";
  * 추가 강화: Firebase Authentication → 로그인 제공업체에서
  * "익명" 만 활성화하고 나머지는 비활성화하세요.
  */
-import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, query, writeBatch, deleteField, getDocs, where, orderBy, limit } from "firebase/firestore";
+import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, query, writeBatch, deleteField, getDocs, where, orderBy, limit, enableMultiTabIndexedDbPersistence } from "firebase/firestore";
 
 // 🔴 [보안 주의] Firebase 설정값이 클라이언트 번들에 포함됩니다.
 // - Firebase API 키 자체는 공개 설계이나, Firestore Security Rules를 반드시 적용하세요.
@@ -68,6 +68,10 @@ const getDateDaysAgoString = (days) => {
 
 const HISTORY_DEFAULT_LOOKBACK_DAYS = 90;
 const HISTORY_DEFAULT_LIMIT = 200;
+const REQUESTS_RECENT_LOOKBACK_DAYS = 30;
+const REQUESTS_RECENT_LIMIT = 250;
+const REQUESTS_CACHE_TTL_MS = 60 * 1000;
+const HISTORY_CACHE_TTL_MS = 60 * 1000;
 
 const normalizeName = (name) => String(name || '').trim();
 
@@ -464,14 +468,12 @@ const EXPLANATION_COPY = {
     en: {
         label: 'English',
         title: 'Quick guide for international students',
-        body: '1) Select storage and lab. 2) Search a chemical in English or Korean, or use a quick button. 3) Enter planned date and quantity. 4) Submit the request and check the status in My Requests.',
-        tip: 'No personal name, signature, or privacy-consent step is required.'
+        body: '1) Select storage and lab. 2) Search a chemical in English or Korean, or use a quick button. 3) Enter planned date and quantity. 4) Submit the request and check the status in My Requests.'
     },
     zh: {
         label: '中文',
         title: '留学生快速说明',
-        body: '1）先选择储存地点和实验室。2）可用英文或韩文搜索物质，也可直接点击常用快捷按钮。3）填写计划日期和数量。4）提交后可在“申请现况”中查看进度。',
-        tip: '现在无需填写姓名、签名或个人信息同意。'
+        body: '1）先选择储存地点和实验室。2）可用英文或韩文搜索物质，也可直接点击常用快捷按钮。3）填写计划日期和数量。4）提交后可在“申请现况”中查看进度。'
     }
 };
 
@@ -780,13 +782,40 @@ export default function App() {
     const timer = setTimeout(() => setChemNameDebounced(invFilter.chemicalName), 200);
     return () => clearTimeout(timer);
   }, [invFilter.chemicalName]);
-  const legacyCleanupRef = useRef({ requests: false, history: false });
+  const legacyCleanupRef = useRef({ requests: 'idle', history: 'idle' });
+  const requestFetchMetaRef = useRef({ scope: '', fetchedAt: 0 });
+  const historyFetchMetaRef = useRef({ scope: '', fetchedAt: 0 });
   const adminActivityRef = useRef(Date.now());
   const staticDataLoadedRef = useRef(false);
   const noticesLoadedRef = useRef(false);
   const [isRealtimePaused, setIsRealtimePaused] = useState(false);
   const [networkState, setNetworkState] = useState(typeof navigator !== 'undefined' && navigator.onLine === false ? 'offline' : 'online');
   const [lastSyncAt, setLastSyncAt] = useState(null);
+  const [isRequestsLoading, setIsRequestsLoading] = useState(false);
+  const [isHistoryLoading, setIsHistoryLoading] = useState(false);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return undefined;
+    const shouldLockScroll = Boolean(
+      inventoryEditModal ||
+      inventoryAdjustModal ||
+      invEditModal ||
+      selectedLabDetail ||
+      editingRequest ||
+      modal.isOpen ||
+      showPasswordModal ||
+      bulkImportModal ||
+      masterAddModal.isOpen ||
+      selectedChemDetail
+    );
+    if (!shouldLockScroll) return undefined;
+
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [bulkImportModal, editingRequest, invEditModal, inventoryAdjustModal, inventoryEditModal, masterAddModal.isOpen, modal.isOpen, selectedChemDetail, selectedLabDetail, showPasswordModal]);
 
   const stripSensitiveRequestFields = useCallback((item) => {
     if (!item) return item;
@@ -800,9 +829,36 @@ export default function App() {
     return chemicals.find((chemical) => buildChemicalAliases(chemical.name).some(alias => normalizeChemicalKey(alias) === key)) || null;
   }, [chemicals]);
 
+  const requestStatusSummary = useMemo(() => {
+    const summary = { pendingReqs: [], approvedCount: 0, rejectedCount: 0 };
+    requests.forEach((req) => {
+      if (req?.status === 'PENDING') summary.pendingReqs.push(req);
+      else if (req?.status === 'APPROVED') summary.approvedCount += 1;
+      else if (req?.status === 'REJECTED') summary.rejectedCount += 1;
+    });
+    return {
+      ...summary,
+      pendingCount: summary.pendingReqs.length,
+    };
+  }, [requests]);
+
+  const chemicalInfoMap = useMemo(() => new Map(chemicals.map((chemical) => [String(chemical?.name || ''), chemical])), [chemicals]);
+
+  const expandedHistoryEntries = useMemo(() => expandHistoryEntries(history)
+    .filter((entry) => entry.status !== 'REJECTED')
+    .sort((a, b) => {
+      const dateCompare = String(b.actionDate || '').localeCompare(String(a.actionDate || ''));
+      if (dateCompare !== 0) return dateCompare;
+      return (Number(b.processedAt) || 0) - (Number(a.processedAt) || 0);
+    }), [history]);
+
+  const historyStorageOptions = useMemo(() => Array.from(new Set(history.map((item) => item.storage).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'ko')), [history]);
+
+  const publicStatusStorageOptions = useMemo(() => Array.from(new Set(inventory.map((item) => item.storage).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'ko')), [inventory]);
+
   const getSuggestedShelves = useCallback((storage, labName, keyword = '') => {
     if (!storage || !labName) return [];
-    const pool = [...inventory, ...requests]
+    const pool = inventory
       .filter(item => item.storage === storage && item.labName === labName && item.shelf && item.shelf !== '미지정')
       .map(item => String(item.shelf).trim())
       .filter(Boolean);
@@ -810,15 +866,21 @@ export default function App() {
     return Array.from(new Set(pool))
       .filter(shelf => matchesShelfKeyword(shelf, keyword))
       .sort((a, b) => a.localeCompare(b, 'ko', { numeric: true }));
-  }, [inventory, requests]);
+  }, [inventory]);
 
   const cleanupLegacyPersonalFields = useCallback(async (collectionName, items) => {
-    if (isDemoMode || !db || !user || legacyCleanupRef.current[collectionName]) return;
+    if (isDemoMode || !db || !user) return;
+
+    const cleanupState = legacyCleanupRef.current[collectionName];
+    if (cleanupState === 'running' || cleanupState === 'done') return;
 
     const targets = items.filter(item => item.signature !== undefined || item.requestorName !== undefined);
-    if (targets.length === 0) return;
+    if (targets.length === 0) {
+      legacyCleanupRef.current[collectionName] = 'done';
+      return;
+    }
 
-    legacyCleanupRef.current[collectionName] = true;
+    legacyCleanupRef.current[collectionName] = 'running';
     try {
       for (let i = 0; i < targets.length; i += 400) {
         const batch = writeBatch(db);
@@ -829,10 +891,12 @@ export default function App() {
         await batch.commit();
       }
     } catch (error) {
+      legacyCleanupRef.current[collectionName] = 'idle';
       console.error(`[민감정보 정리 실패] ${collectionName}`, error);
-    } finally {
-      legacyCleanupRef.current[collectionName] = false;
+      return;
     }
+
+    legacyCleanupRef.current[collectionName] = 'done';
   }, [appId, db, isDemoMode, user]);
 
   // --- 1. Firebase Setup ---
@@ -855,6 +919,12 @@ export default function App() {
         const app = initializeApp(firebaseConfig);
         const authInstance = getAuth(app);
         const dbInstance = getFirestore(app);
+
+        enableMultiTabIndexedDbPersistence(dbInstance).catch((error) => {
+            if (!['failed-precondition', 'unimplemented'].includes(error?.code)) {
+                console.warn('⚠️ Firestore 오프라인 캐시 설정 실패:', error);
+            }
+        });
 
         setAuth(authInstance);
         setDb(dbInstance);
@@ -969,6 +1039,89 @@ export default function App() {
     }
   }, [appId, currentUser, db, isDemoMode, markDataSynced, networkState, normalizeManufacturerItems, sortChemicalsByName, sortLabsByName, user]);
 
+  const mergeAndSortRequests = useCallback((groups) => {
+    const merged = new Map();
+    groups.flat().forEach((item) => {
+      if (!item?.id) return;
+      merged.set(String(item.id), stripSensitiveRequestFields(item));
+    });
+    return [...merged.values()].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  }, [stripSensitiveRequestFields]);
+
+  const loadRequestsOnce = useCallback(async ({ force = false, includeRecent = true } = {}) => {
+    if (isDemoMode || !user || !db || !currentUser || networkState === 'offline') return;
+
+    const scope = `${currentUser}:requests:${REQUESTS_RECENT_LOOKBACK_DAYS}:${includeRecent ? 'recent' : 'pendingOnly'}`;
+    if (!force && requestFetchMetaRef.current.scope === scope && (Date.now() - requestFetchMetaRef.current.fetchedAt) < REQUESTS_CACHE_TTL_MS) return;
+
+    setIsRequestsLoading(true);
+    try {
+      const reqRef = collection(db, 'artifacts', appId, 'public', 'data', 'requests');
+      const pendingSnapshotPromise = getDocs(query(reqRef, where('status', '==', 'PENDING')));
+      let pendingData = [];
+      let recentData = [];
+
+      if (includeRecent) {
+        const recentCutoff = Date.now() - (REQUESTS_RECENT_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+        const [pendingSnapshot, recentSnapshot] = await Promise.all([
+          pendingSnapshotPromise,
+          getDocs(query(reqRef, where('createdAt', '>=', recentCutoff), orderBy('createdAt', 'desc'), limit(REQUESTS_RECENT_LIMIT))),
+        ]);
+        pendingData = pendingSnapshot.docs.map(d => ({ ...d.data(), id: d.id }));
+        recentData = recentSnapshot.docs.map(d => ({ ...d.data(), id: d.id }));
+      } else {
+        const pendingSnapshot = await pendingSnapshotPromise;
+        pendingData = pendingSnapshot.docs.map(d => ({ ...d.data(), id: d.id }));
+      }
+
+      cleanupLegacyPersonalFields('requests', [...pendingData, ...recentData]);
+      setRequests((prev) => {
+        const preservedRecent = includeRecent ? recentData : prev.filter((item) => item.status !== 'PENDING');
+        return mergeAndSortRequests([pendingData, preservedRecent]);
+      });
+      requestFetchMetaRef.current = { scope, fetchedAt: Date.now() };
+      markDataSynced();
+    } catch (error) {
+      console.error('신청 목록 1회 로드 실패', error);
+    } finally {
+      setIsRequestsLoading(false);
+    }
+  }, [appId, cleanupLegacyPersonalFields, currentUser, db, isDemoMode, markDataSynced, mergeAndSortRequests, networkState, user]);
+
+  const loadHistoryOnce = useCallback(async ({ force = false } = {}) => {
+    if (isDemoMode || !user || !db || currentUser !== 'admin' || networkState === 'offline') return;
+
+    const scope = JSON.stringify({ startDate: historyFilter.startDate || '', endDate: historyFilter.endDate || '' });
+    if (!force && historyFetchMetaRef.current.scope === scope && (Date.now() - historyFetchMetaRef.current.fetchedAt) < HISTORY_CACHE_TTL_MS) return;
+
+    setIsHistoryLoading(true);
+    try {
+      const constraints = [];
+      if (historyFilter.startDate) {
+        const startMs = new Date(`${historyFilter.startDate}T00:00:00`).getTime();
+        if (Number.isFinite(startMs)) constraints.push(where('processedAt', '>=', startMs));
+      }
+      if (historyFilter.endDate) {
+        const endMs = new Date(`${historyFilter.endDate}T23:59:59.999`).getTime();
+        if (Number.isFinite(endMs)) constraints.push(where('processedAt', '<=', endMs));
+      }
+      constraints.push(orderBy('processedAt', 'desc'));
+      constraints.push(limit(HISTORY_DEFAULT_LIMIT));
+
+      const histRef = query(collection(db, 'artifacts', appId, 'public', 'data', 'history'), ...constraints);
+      const snapshot = await getDocs(histRef);
+      const data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
+      cleanupLegacyPersonalFields('history', data);
+      setHistory(data.map(stripSensitiveRequestFields).sort((a, b) => (b.processedAt || 0) - (a.processedAt || 0)));
+      historyFetchMetaRef.current = { scope, fetchedAt: Date.now() };
+      markDataSynced();
+    } catch (error) {
+      console.error('기록 1회 로드 실패', error);
+    } finally {
+      setIsHistoryLoading(false);
+    }
+  }, [appId, cleanupLegacyPersonalFields, currentUser, db, historyFilter.endDate, historyFilter.startDate, isDemoMode, markDataSynced, networkState, stripSensitiveRequestFields, user]);
+
   // --- 2. Data Sync Effects ---
   useEffect(() => {
     loadNoticesOnce();
@@ -994,6 +1147,9 @@ export default function App() {
     return () => unsubNotices();
   }, [activeTab, appId, currentUser, db, isDemoMode, isRealtimePaused, markDataSynced, networkState, sortNoticeItems, user]);
 
+  const shouldRealtimeRequests = currentUser === 'admin' && ['approvals', 'dashboard'].includes(activeTab);
+  const shouldIncludeRecentRequests = activeTab === 'my_requests' || (currentUser === 'admin' && activeTab === 'approvals' && approvalViewTab === 'all');
+
   useEffect(() => {
     if (isDemoMode || !user || !db) return;
 
@@ -1001,25 +1157,35 @@ export default function App() {
       setInventory([]);
       setRequests([]);
       setHistory([]);
+      requestFetchMetaRef.current = { scope: '', fetchedAt: 0 };
+      historyFetchMetaRef.current = { scope: '', fetchedAt: 0 };
       return;
     }
 
     if (networkState === 'offline' || isRealtimePaused) return;
 
-    const reqRef = collection(db, 'artifacts', appId, 'public', 'data', 'requests');
+    if (!shouldRealtimeRequests && activeTab === 'my_requests') {
+      loadRequestsOnce({ includeRecent: true });
+    }
+
+    if (!shouldRealtimeRequests) return;
+
+    loadRequestsOnce({ includeRecent: shouldIncludeRecentRequests });
+    const reqRef = query(collection(db, 'artifacts', appId, 'public', 'data', 'requests'), where('status', '==', 'PENDING'));
     const unsubReq = onSnapshot(reqRef, (snapshot) => {
-      const data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
-      cleanupLegacyPersonalFields('requests', data);
-      setRequests(data.map(stripSensitiveRequestFields).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)));
+      const pendingData = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
+      cleanupLegacyPersonalFields('requests', pendingData);
+      setRequests(prev => mergeAndSortRequests([pendingData, prev.filter(item => item.status !== 'PENDING')]));
+      requestFetchMetaRef.current = { scope: `${currentUser}:requests:${REQUESTS_RECENT_LOOKBACK_DAYS}`, fetchedAt: Date.now() };
       markDataSynced();
     });
 
     return () => unsubReq();
-  }, [user, db, appId, isDemoMode, cleanupLegacyPersonalFields, stripSensitiveRequestFields, currentUser, networkState, isRealtimePaused, markDataSynced]);
+  }, [activeTab, appId, approvalViewTab, cleanupLegacyPersonalFields, currentUser, db, isDemoMode, isRealtimePaused, loadRequestsOnce, markDataSynced, mergeAndSortRequests, networkState, shouldIncludeRecentRequests, shouldRealtimeRequests, user]);
 
   const shouldSubscribeInventory = currentUser === 'admin'
-    ? ['dashboard', 'admin_inventory', 'approvals', 'public_status', 'safety_status'].includes(activeTab)
-    : ['request', 'public_status'].includes(activeTab);
+    ? ['dashboard', 'admin_inventory', 'approvals'].includes(activeTab)
+    : ['request', 'public_status', 'safety_status'].includes(activeTab);
 
   useEffect(() => {
     if (isDemoMode || !user || !db || !currentUser) return;
@@ -1038,29 +1204,8 @@ export default function App() {
   useEffect(() => {
     if (isDemoMode || !user || !db || currentUser !== 'admin' || activeTab !== 'history') return;
     if (networkState === 'offline' || isRealtimePaused) return;
-
-    const constraints = [];
-    if (historyFilter.startDate) {
-      const startMs = new Date(`${historyFilter.startDate}T00:00:00`).getTime();
-      if (Number.isFinite(startMs)) constraints.push(where('processedAt', '>=', startMs));
-    }
-    if (historyFilter.endDate) {
-      const endMs = new Date(`${historyFilter.endDate}T23:59:59.999`).getTime();
-      if (Number.isFinite(endMs)) constraints.push(where('processedAt', '<=', endMs));
-    }
-    constraints.push(orderBy('processedAt', 'desc'));
-    constraints.push(limit(HISTORY_DEFAULT_LIMIT));
-
-    const histRef = query(collection(db, 'artifacts', appId, 'public', 'data', 'history'), ...constraints);
-    const unsubHist = onSnapshot(histRef, (snapshot) => {
-      const data = snapshot.docs.map(d => ({ ...d.data(), id: d.id }));
-      cleanupLegacyPersonalFields('history', data);
-      setHistory(data.map(stripSensitiveRequestFields).sort((a, b) => (b.processedAt || 0) - (a.processedAt || 0)));
-      markDataSynced();
-    });
-
-    return () => unsubHist();
-  }, [activeTab, appId, cleanupLegacyPersonalFields, currentUser, db, historyFilter.endDate, historyFilter.startDate, isDemoMode, isRealtimePaused, markDataSynced, networkState, stripSensitiveRequestFields, user]);
+    loadHistoryOnce();
+  }, [activeTab, currentUser, db, isDemoMode, isRealtimePaused, loadHistoryOnce, networkState, user]);
 
   // --- Logic Helpers ---
   const showAlert = (title, message) => setModal({ isOpen: true, type: 'info', title, message, onConfirm: null });
@@ -1085,8 +1230,16 @@ export default function App() {
   // ── 로그아웃: 모든 UI 상태 초기화 ──
   const handleLogout = () => {
       setCurrentUser(null);
+      legacyCleanupRef.current = { requests: 'idle', history: 'idle' };
+      requestFetchMetaRef.current = { scope: '', fetchedAt: 0 };
+      historyFetchMetaRef.current = { scope: '', fetchedAt: 0 };
       staticDataLoadedRef.current = false;
       noticesLoadedRef.current = false;
+      setRequests([]);
+      setHistory([]);
+      setInventory([]);
+      setIsRequestsLoading(false);
+      setIsHistoryLoading(false);
       setBulkImportModal(false);
       setBulkImportRows([]);
       setBulkImportErrors([]);
@@ -2238,9 +2391,9 @@ export default function App() {
     const hasBottlePreset = Number(inventoryAdjustModal.bottleSize) > 0;
 
     return (
-      <div className="fixed inset-0 bg-black/55 flex items-center justify-center z-[120] p-4">
-        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-6 space-y-5">
-          <div className="flex items-start justify-between gap-4">
+      <div className="fixed inset-0 bg-black/55 flex items-end sm:items-center justify-center z-[120] p-2 sm:p-4">
+        <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-lg max-h-[calc(100dvh-0.5rem)] sm:max-h-[85vh] overflow-hidden flex flex-col">
+          <div className="flex items-start justify-between gap-4 px-5 pt-5 sm:px-6 sm:pt-6">
             <div>
               <h3 className="text-lg font-bold text-slate-800">재고 불일치 빠른 보정</h3>
               <p className="text-sm text-slate-500 mt-1">실사 수량 기준으로 즉시 맞추고, 보정 이력을 남깁니다.</p>
@@ -2261,7 +2414,7 @@ export default function App() {
             </div>
           </div>
 
-          <div className="space-y-3">
+          <div className="space-y-3 overflow-y-auto px-5 pb-6 sm:px-6">
             <div>
               <label className="text-xs font-bold text-slate-600 block mb-1.5">실재고 수량</label>
               <div className="flex gap-2">
@@ -2308,9 +2461,9 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex gap-3 pt-1">
-            <button onClick={() => setInventoryAdjustModal(null)} className="flex-1 py-2.5 rounded-xl bg-slate-100 text-slate-600 font-bold hover:bg-slate-200">취소</button>
-            <button onClick={handleQuickInventoryAdjust} className="flex-1 py-2.5 rounded-xl bg-blue-600 text-white font-bold hover:bg-blue-700 shadow">재고 보정 저장</button>
+          <div className="sticky bottom-0 mt-auto flex gap-3 border-t bg-white px-5 pt-3 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] sm:px-6">
+            <button onClick={() => setInventoryAdjustModal(null)} className="flex-1 py-3 rounded-xl bg-slate-100 text-slate-600 font-bold hover:bg-slate-200">취소</button>
+            <button onClick={handleQuickInventoryAdjust} className="flex-1 py-3 rounded-xl bg-blue-600 text-white font-bold hover:bg-blue-700 shadow">재고 보정 저장</button>
           </div>
         </div>
       </div>
@@ -2335,9 +2488,9 @@ export default function App() {
     }, inventoryEditModal.id);
 
     return (
-      <div className="fixed inset-0 bg-black/55 flex items-center justify-center z-[120] p-4">
-        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl p-6 space-y-5">
-          <div className="flex items-start justify-between gap-4">
+      <div className="fixed inset-0 bg-black/55 flex items-end sm:items-center justify-center z-[120] p-2 sm:p-4">
+        <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-3xl max-h-[calc(100dvh-0.5rem)] sm:max-h-[88vh] overflow-hidden flex flex-col">
+          <div className="flex items-start justify-between gap-4 px-5 pt-5 sm:px-6 sm:pt-6">
             <div>
               <h3 className="text-lg font-bold text-slate-800">재고 기본 정보 수정</h3>
               <p className="text-sm text-slate-500 mt-1">실험실, 저장소, 선반, 제조사, 물질명 등 잘못 들어간 재고 데이터를 바로잡습니다.</p>
@@ -2345,127 +2498,129 @@ export default function App() {
             <button onClick={() => setInventoryEditModal(null)} className="text-slate-400 hover:text-slate-600"><X size={20}/></button>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs font-bold text-slate-600 mb-1.5">저장소</label>
-              <select
-                className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                value={inventoryEditModal.storage}
-                onChange={e => setInventoryEditModal(prev => ({ ...prev, storage: e.target.value }))}>
-                <option value="">저장소 선택</option>
-                {storageOptions.map(storage => <option key={storage} value={storage}>{storage}</option>)}
-              </select>
+          <div className="overflow-y-auto px-5 pb-6 sm:px-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1.5">저장소</label>
+                <select
+                  className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  value={inventoryEditModal.storage}
+                  onChange={e => setInventoryEditModal(prev => ({ ...prev, storage: e.target.value }))}>
+                  <option value="">저장소 선택</option>
+                  {storageOptions.map(storage => <option key={storage} value={storage}>{storage}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1.5">실험실</label>
+                <input
+                  list="inventory-edit-lab-list"
+                  className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  value={inventoryEditModal.labName}
+                  onChange={e => setInventoryEditModal(prev => ({ ...prev, labName: e.target.value }))}
+                  placeholder="실험실명 입력 또는 선택"
+                />
+                <datalist id="inventory-edit-lab-list">
+                  {[...labs].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko')).map((lab) => <option key={lab.id || lab.name} value={lab.name} />)}
+                </datalist>
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1.5">선반</label>
+                <input
+                  list="inventory-edit-shelf-list"
+                  className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  value={inventoryEditModal.shelf}
+                  onChange={e => setInventoryEditModal(prev => ({ ...prev, shelf: e.target.value }))}
+                  placeholder="미입력 시 미지정"
+                />
+                <datalist id="inventory-edit-shelf-list">
+                  {shelfSuggestions.map((shelf) => <option key={shelf} value={shelf} />)}
+                </datalist>
+                {shelfSuggestions.length > 0 && <p className="mt-1 text-[11px] text-slate-400">추천 선반: {shelfSuggestions.slice(0, 6).join(', ')}</p>}
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1.5">제조사</label>
+                <input
+                  list="inventory-edit-manufacturer-list"
+                  className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  value={inventoryEditModal.manufacturer}
+                  onChange={e => setInventoryEditModal(prev => ({ ...prev, manufacturer: e.target.value }))}
+                  placeholder="제조사 입력 또는 선택"
+                />
+                <datalist id="inventory-edit-manufacturer-list">
+                  {manufacturerOptions.map((name) => <option key={name} value={name} />)}
+                </datalist>
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1.5">물질명</label>
+                <input
+                  list="inventory-edit-chemical-list"
+                  className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  value={inventoryEditModal.chemicalName}
+                  onChange={e => setInventoryEditModal(prev => ({ ...prev, chemicalName: e.target.value }))}
+                  placeholder="한글/영문 물질명"
+                />
+                <datalist id="inventory-edit-chemical-list">
+                  {[...chemicals].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko')).map((chemical) => <option key={chemical.id || chemical.name} value={chemical.name} />)}
+                </datalist>
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1.5">성상</label>
+                <select
+                  className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  value={inventoryEditModal.chemType}
+                  onChange={e => setInventoryEditModal(prev => ({ ...prev, chemType: e.target.value }))}>
+                  {['1석유류(비)', '1석유류(수)', '알코올류', '2석유류(비)', '2석유류(수)', '3석유류(비)', '3석유류(수)', '4석유류', '동식물유', '특수인화물', '산화성액체', '유독물질', '해당없음', '미지정'].map(type => <option key={type} value={type}>{type}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1.5">수량</label>
+                <input
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  value={inventoryEditModal.amount}
+                  onChange={e => setInventoryEditModal(prev => ({ ...prev, amount: e.target.value }))}
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1.5">단위</label>
+                <input
+                  className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  value={inventoryEditModal.unit || 'L'}
+                  onChange={e => setInventoryEditModal(prev => ({ ...prev, unit: e.target.value }))}
+                  placeholder="예: L, kg"
+                />
+              </div>
             </div>
-            <div>
-              <label className="block text-xs font-bold text-slate-600 mb-1.5">실험실</label>
-              <input
-                list="inventory-edit-lab-list"
+
+            <div className="mt-5">
+              <label className="block text-xs font-bold text-slate-600 mb-1.5">수정 사유</label>
+              <textarea
+                rows={3}
                 className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                value={inventoryEditModal.labName}
-                onChange={e => setInventoryEditModal(prev => ({ ...prev, labName: e.target.value }))}
-                placeholder="실험실명 입력 또는 선택"
+                value={inventoryEditModal.reason}
+                onChange={e => setInventoryEditModal(prev => ({ ...prev, reason: e.target.value }))}
+                placeholder="예: 잘못 등록된 실험실/제조사 정정, 저장소 위치 오기입 수정"
               />
-              <datalist id="inventory-edit-lab-list">
-                {[...labs].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko')).map((lab) => <option key={lab.id || lab.name} value={lab.name} />)}
-              </datalist>
             </div>
-            <div>
-              <label className="block text-xs font-bold text-slate-600 mb-1.5">선반</label>
-              <input
-                list="inventory-edit-shelf-list"
-                className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                value={inventoryEditModal.shelf}
-                onChange={e => setInventoryEditModal(prev => ({ ...prev, shelf: e.target.value }))}
-                placeholder="미입력 시 미지정"
-              />
-              <datalist id="inventory-edit-shelf-list">
-                {shelfSuggestions.map((shelf) => <option key={shelf} value={shelf} />)}
-              </datalist>
-              {shelfSuggestions.length > 0 && <p className="mt-1 text-[11px] text-slate-400">추천 선반: {shelfSuggestions.slice(0, 6).join(', ')}</p>}
-            </div>
-            <div>
-              <label className="block text-xs font-bold text-slate-600 mb-1.5">제조사</label>
-              <input
-                list="inventory-edit-manufacturer-list"
-                className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                value={inventoryEditModal.manufacturer}
-                onChange={e => setInventoryEditModal(prev => ({ ...prev, manufacturer: e.target.value }))}
-                placeholder="제조사 입력 또는 선택"
-              />
-              <datalist id="inventory-edit-manufacturer-list">
-                {manufacturerOptions.map((name) => <option key={name} value={name} />)}
-              </datalist>
-            </div>
-            <div>
-              <label className="block text-xs font-bold text-slate-600 mb-1.5">물질명</label>
-              <input
-                list="inventory-edit-chemical-list"
-                className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                value={inventoryEditModal.chemicalName}
-                onChange={e => setInventoryEditModal(prev => ({ ...prev, chemicalName: e.target.value }))}
-                placeholder="한글/영문 물질명"
-              />
-              <datalist id="inventory-edit-chemical-list">
-                {[...chemicals].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko')).map((chemical) => <option key={chemical.id || chemical.name} value={chemical.name} />)}
-              </datalist>
-            </div>
-            <div>
-              <label className="block text-xs font-bold text-slate-600 mb-1.5">성상</label>
-              <select
-                className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                value={inventoryEditModal.chemType}
-                onChange={e => setInventoryEditModal(prev => ({ ...prev, chemType: e.target.value }))}>
-                {['1석유류(비)', '1석유류(수)', '알코올류', '2석유류(비)', '2석유류(수)', '3석유류(비)', '3석유류(수)', '4석유류', '동식물유', '특수인화물', '산화성액체', '유독물질', '해당없음', '미지정'].map(type => <option key={type} value={type}>{type}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs font-bold text-slate-600 mb-1.5">수량</label>
-              <input
-                type="number"
-                min="0"
-                step="0.1"
-                className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                value={inventoryEditModal.amount}
-                onChange={e => setInventoryEditModal(prev => ({ ...prev, amount: e.target.value }))}
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-bold text-slate-600 mb-1.5">단위</label>
-              <input
-                className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                value={inventoryEditModal.unit || 'L'}
-                onChange={e => setInventoryEditModal(prev => ({ ...prev, unit: e.target.value }))}
-                placeholder="예: L, kg"
-              />
-            </div>
+
+            {duplicateDetected && (
+              <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+                동일한 저장소/실험실/선반/물질/제조사 조합이 이미 존재합니다. 중복 행 생성을 막기 위해 현재 상태로는 저장되지 않습니다.
+              </div>
+            )}
+
+            {inventoryEditModal.lastEditedAt && (
+              <div className="mt-5 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500">
+                최근 수정: <span className="font-bold text-slate-700">{formatAdminDateTime(inventoryEditModal.lastEditedAt)}</span> · {inventoryEditModal.lastEditReason || '-'}
+              </div>
+            )}
           </div>
 
-          <div>
-            <label className="block text-xs font-bold text-slate-600 mb-1.5">수정 사유</label>
-            <textarea
-              rows={3}
-              className="w-full border p-3 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
-              value={inventoryEditModal.reason}
-              onChange={e => setInventoryEditModal(prev => ({ ...prev, reason: e.target.value }))}
-              placeholder="예: 잘못 등록된 실험실/제조사 정정, 저장소 위치 오기입 수정"
-            />
-          </div>
-
-          {duplicateDetected && (
-            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
-              동일한 저장소/실험실/선반/물질/제조사 조합이 이미 존재합니다. 중복 행 생성을 막기 위해 현재 상태로는 저장되지 않습니다.
-            </div>
-          )}
-
-          {inventoryEditModal.lastEditedAt && (
-            <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500">
-              최근 수정: <span className="font-bold text-slate-700">{formatAdminDateTime(inventoryEditModal.lastEditedAt)}</span> · {inventoryEditModal.lastEditReason || '-'}
-            </div>
-          )}
-
-          <div className="flex gap-3 pt-1">
-            <button onClick={() => setInventoryEditModal(null)} className="flex-1 py-2.5 rounded-xl bg-slate-100 text-slate-600 font-bold hover:bg-slate-200">취소</button>
-            <button onClick={handleSaveInventoryRecordEdit} className="flex-1 py-2.5 rounded-xl bg-blue-600 text-white font-bold hover:bg-blue-700 shadow">재고 정보 저장</button>
+          <div className="sticky bottom-0 mt-auto flex gap-3 border-t bg-white px-5 pt-3 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] sm:px-6">
+            <button onClick={() => setInventoryEditModal(null)} className="flex-1 py-3 rounded-xl bg-slate-100 text-slate-600 font-bold hover:bg-slate-200">취소</button>
+            <button onClick={handleSaveInventoryRecordEdit} className="flex-1 py-3 rounded-xl bg-blue-600 text-white font-bold hover:bg-blue-700 shadow">재고 정보 저장</button>
           </div>
         </div>
       </div>
@@ -2475,13 +2630,14 @@ export default function App() {
   const renderInvEditModal = () => {
     if (!invEditModal) return null;
     return (
-      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-        <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 space-y-4">
-          <div className="flex items-center justify-between">
+      <div className="fixed inset-0 bg-black/50 flex items-end sm:items-center justify-center z-50 p-2 sm:p-4">
+        <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-sm max-h-[calc(100dvh-0.5rem)] sm:max-h-[80vh] overflow-hidden flex flex-col">
+          <div className="flex items-center justify-between px-5 pt-5 sm:px-6 sm:pt-6">
             <h3 className="text-lg font-bold text-slate-800">병/캔 단위 설정</h3>
             <button onClick={() => setInvEditModal(null)} className="text-slate-400 hover:text-slate-600"><X size={20}/></button>
           </div>
-          <div className="bg-slate-50 rounded-lg p-3 text-sm text-slate-600">
+          <div className="overflow-y-auto px-5 pb-6 sm:px-6">
+            <div className="bg-slate-50 rounded-lg p-3 text-sm text-slate-600">
             <div className="font-bold text-slate-800">{invEditModal.chemicalName}</div>
             <div className="text-xs text-slate-500">{invEditModal.storage} · {invEditModal.labName}</div>
             <div className="text-xs text-slate-500 mt-1">현재 재고: <span className="font-bold text-blue-600">{invEditModal.amount}{invEditModal.unit || 'L'}</span></div>
@@ -2552,9 +2708,10 @@ export default function App() {
               </div>
             )}
           </div>
-          <div className="flex gap-3 pt-2">
-            <button onClick={() => setInvEditModal(null)} className="flex-1 py-2.5 rounded-xl bg-slate-100 text-slate-600 font-bold hover:bg-slate-200">취소</button>
-            <button onClick={handleSaveInvBottleUnit} className="flex-1 py-2.5 rounded-xl bg-blue-600 text-white font-bold hover:bg-blue-700 shadow">저장</button>
+          </div>
+          <div className="sticky bottom-0 mt-auto flex gap-3 border-t bg-white px-5 pt-3 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] sm:px-6">
+            <button onClick={() => setInvEditModal(null)} className="flex-1 py-3 rounded-xl bg-slate-100 text-slate-600 font-bold hover:bg-slate-200">취소</button>
+            <button onClick={handleSaveInvBottleUnit} className="flex-1 py-3 rounded-xl bg-blue-600 text-white font-bold hover:bg-blue-700 shadow">저장</button>
           </div>
         </div>
       </div>
@@ -2879,7 +3036,7 @@ export default function App() {
               <NavItem tab="dashboard" icon={LayoutDashboard} label="대시보드" />
               <NavItem tab="notices" icon={Megaphone} label="공지사항 관리" badge={notices.filter(n=>n.important).length} />
               <NavItem tab="admin_inventory" icon={ClipboardList} label="재고 현황" />
-              <NavItem tab="approvals" icon={CheckCircle} label="승인 대기/관리" badge={requests.filter(r => r.status === 'PENDING').length} />
+              <NavItem tab="approvals" icon={CheckCircle} label="승인 대기/관리" badge={requestStatusSummary.pendingCount} />
               <NavItem tab="history" icon={ArrowRightLeft} label="반출입 기록 조회" />
               <NavItem tab="masterData" icon={Database} label="기초 데이터 관리" />
             </>
@@ -2936,7 +3093,6 @@ export default function App() {
           <div className="mt-3 rounded-lg border border-blue-100 bg-white px-4 py-3">
             <div className="text-sm font-bold text-slate-800">{EXPLANATION_COPY[uiLang].title}</div>
             <p className="mt-1 text-sm text-slate-600 leading-6">{EXPLANATION_COPY[uiLang].body}</p>
-            <p className="mt-2 text-xs text-blue-700">{EXPLANATION_COPY[uiLang].tip}</p>
           </div>
         </div>
 
@@ -3226,7 +3382,7 @@ export default function App() {
           </div>
           <div className="bg-white p-6 rounded-xl shadow-sm border border-l-4 border-l-orange-500">
              <h3 className="text-slate-500 text-sm font-medium mb-1">승인 대기</h3>
-             <p className="text-3xl font-bold text-orange-600">{requests.filter(r => r.status === 'PENDING').length} <span className="text-sm font-normal text-slate-400">건</span></p>
+             <p className="text-3xl font-bold text-orange-600">{requestStatusSummary.pendingCount} <span className="text-sm font-normal text-slate-400">건</span></p>
           </div>
           <div className="bg-white p-6 rounded-xl shadow-sm border border-l-4 border-l-green-500">
              <h3 className="text-slate-500 text-sm font-medium mb-1">등록 실험실</h3>
@@ -3648,10 +3804,9 @@ export default function App() {
                 <Filter size={18} className="text-slate-500"/>
                 <select className="border p-2 rounded flex-1 md:flex-none" value={filterStorage} onChange={e => setFilterStorage(e.target.value)}>
                     <option value="All">전체 저장소</option>
-                    {[...new Set(inventory.map(i=>i.storage))].filter(Boolean).sort((a,b)=>a.localeCompare(b,'ko')).map(s => <option key={s} value={s}>{s}</option>)}
+                    {publicStatusStorageOptions.map(s => <option key={s} value={s}>{s}</option>)}
                 </select>
             </div>
-            <p className="text-xs text-slate-500 md:ml-auto flex items-center gap-1 bg-slate-100 p-2 rounded w-full md:w-auto"><Info size={14}/> 선반별 합산 요약은 제거하고, 실험실별 보유 목록 중심으로 정리했습니다.</p>
          </div>
 
          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -3942,14 +4097,14 @@ export default function App() {
   };
 
   const renderApprovalScreen = () => {
-    const pendingReqs = requests.filter(req => req.status === 'PENDING');
+    const pendingReqs = requestStatusSummary.pendingReqs;
     const allReqs = requests;
     // approvalViewTab은 이제 컴포넌트 레벨 state 사용 (훅 위반 수정)
     const displayReqs = (approvalViewTab === 'pending' ? pendingReqs : allReqs)
       .slice()
       .sort((a, b) => String(b.actionDate || '').localeCompare(String(a.actionDate || '')) || ((b.createdAt || 0) - (a.createdAt || 0)));
-    const approvedCount = requests.filter(req => req.status === 'APPROVED').length;
-    const rejectedCount = requests.filter(req => req.status === 'REJECTED').length;
+    const approvedCount = requestStatusSummary.approvedCount;
+    const rejectedCount = requestStatusSummary.rejectedCount;
     const allocationDraftRows = editingRequest ? getEditableAllocationRows(editingRequest) : [];
     const allocationKeyword = allocationDraftRows.find(row => String(row.shelf || '').trim())?.shelf || (editingRequest?.shelf === '미지정' ? '' : (editingRequest?.shelf || ''));
     const shelfSuggestions = editingRequest
@@ -3963,7 +4118,15 @@ export default function App() {
 
     return (
     <div className="space-y-4">
-      <h2 className="text-xl md:text-2xl font-bold text-slate-800">승인 대기 / 관리</h2>
+      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div>
+          <h2 className="text-xl md:text-2xl font-bold text-slate-800">승인 대기 / 관리</h2>
+          <p className="text-sm text-slate-500 mt-1">승인 대기 항목은 실시간으로 갱신되고, 완료/반려 항목은 전체 내역 탭에서 최근 30일 범위만 불러옵니다.</p>
+        </div>
+        <button onClick={() => loadRequestsOnce({ force: true, includeRecent: approvalViewTab === 'all' })} className="self-start px-3 py-2 rounded-lg border bg-white text-slate-700 font-bold text-sm hover:bg-slate-50 flex items-center gap-2">
+          <RotateCcw size={14}/> {isRequestsLoading ? '불러오는 중...' : '새로고침'}
+        </button>
+      </div>
 
       {/* 탭 전환 */}
       <div className="flex gap-2">
@@ -4285,9 +4448,14 @@ export default function App() {
   const renderMyRequestsScreen = () => (
     <>
       <div className="space-y-4">
-        <div>
-          <h2 className="text-xl md:text-2xl font-bold text-slate-800 flex items-center gap-2"><History className="text-blue-600"/> 신청 현황</h2>
-          <p className="text-sm text-slate-500 mt-1">연구실 사용자는 신청 내역을 삭제할 수 없으며, 변경이 필요하면 관리자에게 요청해주세요.</p>
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <h2 className="text-xl md:text-2xl font-bold text-slate-800 flex items-center gap-2"><History className="text-blue-600"/> 신청 현황</h2>
+            <p className="text-sm text-slate-500 mt-1">연구실 사용자는 신청 내역을 삭제할 수 없으며, 최근 30일 + 승인 대기 신청만 불러옵니다. 상태가 바뀌지 않았다면 새로고침을 눌러 주세요.</p>
+          </div>
+          <button onClick={() => loadRequestsOnce({ force: true })} className="self-start px-3 py-2 rounded-lg border bg-white text-slate-700 font-bold text-sm hover:bg-slate-50 flex items-center gap-2">
+            <RotateCcw size={14}/> {isRequestsLoading ? '불러오는 중...' : '새로고침'}
+          </button>
         </div>
 
         <div className="md:hidden space-y-3">
@@ -4350,15 +4518,7 @@ export default function App() {
   );
 
   const renderHistoryScreen = () => {
-    const expandedHistory = expandHistoryEntries(history)
-        .filter(h => h.status !== 'REJECTED')
-        .sort((a, b) => {
-            const dateCompare = String(b.actionDate || '').localeCompare(String(a.actionDate || ''));
-            if (dateCompare !== 0) return dateCompare;
-            return (Number(b.processedAt) || 0) - (Number(a.processedAt) || 0);
-        });
-
-    const filteredHistory = expandedHistory.filter(h => {
+    const filteredHistory = expandedHistoryEntries.filter(h => {
         if (historyFilter.type !== 'All' && h.type !== historyFilter.type) return false;
         if (historyFilter.storage !== 'All' && h.storage !== historyFilter.storage) return false;
         if (historyFilter.startDate && h.actionDate < historyFilter.startDate) return false;
@@ -4378,10 +4538,11 @@ export default function App() {
     return (
         <>
         <div className="space-y-4">
-            <h2 className="text-xl md:text-2xl font-bold text-slate-800 flex items-center gap-2"><ArrowRightLeft className="text-blue-600"/> 반출입 기록 조회</h2>
-
-            <div className="rounded-2xl border border-blue-100 bg-blue-50 px-4 py-3 text-sm text-blue-800">
-                여러 선반으로 승인된 기록은 이제 <strong>선반별 개별 행</strong>으로 분리해서 보여주고, CSV/HTML 다운로드도 같은 구조로 내보냅니다.<br />기본 조회 범위는 <strong>최근 90일</strong>이며, 실시간 조회는 <strong>최대 200건</strong>으로 제한해 Firestore 읽기량을 줄였습니다.
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <h2 className="text-xl md:text-2xl font-bold text-slate-800 flex items-center gap-2"><ArrowRightLeft className="text-blue-600"/> 반출입 기록 조회</h2>
+                <button onClick={() => loadHistoryOnce({ force: true })} className="self-start px-3 py-2 rounded-lg border bg-white text-slate-700 font-bold text-sm hover:bg-slate-50 flex items-center gap-2">
+                    <RotateCcw size={14}/> {isHistoryLoading ? '불러오는 중...' : '새로고침'}
+                </button>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
@@ -4441,14 +4602,14 @@ export default function App() {
                 </select>
                 <select className="border p-2 rounded focus:ring-2 focus:ring-blue-500" value={historyFilter.storage} onChange={e => setHistoryFilter({...historyFilter, storage: e.target.value})}>
                     <option value="All">전체 저장소</option>
-                    {[...new Set(history.map(h => h.storage).filter(Boolean))].sort().map(s => <option key={s} value={s}>{s}</option>)}
+                    {historyStorageOptions.map(s => <option key={s} value={s}>{s}</option>)}
                 </select>
                 <div className="ml-auto w-full md:w-auto">
                     <div className="flex gap-2 flex-wrap w-full md:w-auto">
                     <button onClick={() => {
                         const csvHeader = "일자,구분,저장소,선반,실험실,물질명,CAS No.,성상,수량,제조사\n";
                         const csvData = filteredHistory.map(h => {
-                            const chemInfo = chemicals.find(c => c.name === h.chemicalName) || {};
+                            const chemInfo = chemicalInfoMap.get(String(h.chemicalName || '')) || {};
                             const casNo = h.cas && h.cas !== '-' ? h.cas : (chemInfo.cas || '-');
                             const chemType = normalizeChemicalType(h.chemType || chemInfo.type || '-') || '-';
                             const shelfInfo = h.shelf || '미지정';
@@ -4471,7 +4632,7 @@ export default function App() {
                     </button>
                     <button onClick={() => {
                         const rows = filteredHistory.map(h => {
-                            const chemInfo = chemicals.find(c => c.name === h.chemicalName) || {};
+                            const chemInfo = chemicalInfoMap.get(String(h.chemicalName || '')) || {};
                             const casNo = h.cas && h.cas !== '-' ? h.cas : (chemInfo.cas || '-');
                             const chemType = normalizeChemicalType(h.chemType || chemInfo.type || '-') || '-';
                             const shelfInfo = h.shelf || '미지정';

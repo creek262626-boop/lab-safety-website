@@ -30,7 +30,7 @@ import { getAuth, signInAnonymously, onAuthStateChanged } from "firebase/auth";
  * 추가 강화: Firebase Authentication → 로그인 제공업체에서
  * "익명" 만 활성화하고 나머지는 비활성화하세요.
  */
-import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, query, writeBatch, deleteField, getDocs, where, orderBy, limit, enableMultiTabIndexedDbPersistence } from "firebase/firestore";
+import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, query, writeBatch, runTransaction, getDoc, deleteField, getDocs, where, orderBy, limit, enableMultiTabIndexedDbPersistence } from "firebase/firestore";
 
 // 🔴 [보안 주의] Firebase 설정값이 클라이언트 번들에 포함됩니다.
 // - Firebase API 키 자체는 공개 설계이나, Firestore Security Rules를 반드시 적용하세요.
@@ -224,6 +224,46 @@ const getRequestShelfDisplay = (req) => {
         return req.shelfAllocations.map(item => `${item.shelf}(${item.amount}${req.unit || 'L'})`).join(', ');
     }
     return req?.shelf || '미지정';
+};
+
+
+const isUnspecifiedRequestValue = (value) => {
+    const normalized = normalizeChemicalKey(value).replace(/\./g, '');
+    return !normalized || ['-', '미지정', '선택', '없음', 'na', 'n/a', 'null', 'undefined'].includes(normalized);
+};
+
+const getRequestCompleteness = (req) => {
+    const missingFields = [];
+    if (isUnspecifiedRequestValue(req?.storage)) missingFields.push('저장소');
+    if (isUnspecifiedRequestValue(req?.labName)) missingFields.push('실험실');
+    if (isUnspecifiedRequestValue(req?.chemicalName)) missingFields.push('물질명');
+    if (isUnspecifiedRequestValue(getManufacturerName(req?.manufacturer))) missingFields.push('제조사');
+    if (isUnspecifiedRequestValue(normalizeChemicalType(req?.chemType || req?.type || ''))) missingFields.push('성상');
+    if (isUnspecifiedRequestValue(req?.actionDate || req?.date)) missingFields.push('반출입일');
+
+    const amount = Number(req?.amount);
+    if (!Number.isFinite(amount) || amount <= 0) missingFields.push('수량');
+    if (isUnspecifiedRequestValue(req?.unit)) missingFields.push('단위');
+
+    const allocations = Array.isArray(req?.shelfAllocations) && req.shelfAllocations.length > 0
+        ? req.shelfAllocations
+        : [{ shelf: req?.shelf || '', amount: req?.amount }];
+    if (allocations.some((allocation) => isUnspecifiedRequestValue(allocation?.shelf))) {
+        missingFields.push('선반');
+    }
+
+    const uniqueMissingFields = Array.from(new Set(missingFields));
+    const isComplete = uniqueMissingFields.length === 0;
+    return {
+        isComplete,
+        missingFields: uniqueMissingFields,
+        badgeLabel: isComplete ? '입력 완료' : '미지정 있음',
+        helperText: isComplete ? '제조사·선반 등 핵심 항목 입력 완료' : `미기입: ${uniqueMissingFields.join(', ')}`,
+        cardClass: isComplete ? 'border-emerald-200 bg-emerald-50/60' : 'border-rose-200 bg-rose-50/70',
+        rowClass: isComplete ? 'bg-emerald-50/35' : 'bg-rose-50/45',
+        badgeClass: isComplete ? 'border border-emerald-200 bg-emerald-100 text-emerald-700' : 'border border-rose-200 bg-rose-100 text-rose-700',
+        helperClass: isComplete ? 'text-emerald-700' : 'text-rose-700',
+    };
 };
 
 const buildHistoryEntriesFromRequest = (req, extraFields = {}) => {
@@ -768,6 +808,10 @@ export default function App() {
 
   // ── 승인 탭 상태 (훅 위반 수정: renderApprovalScreen 내부에서 이동) ──
   const [approvalViewTab, setApprovalViewTab] = useState('pending');
+  const [approvalQuickFilter, setApprovalQuickFilter] = useState('all');
+  const [processingRequestIds, setProcessingRequestIds] = useState(() => new Set());
+  const lastActionAtRef = useRef(new Map()); // 모바일 ghost click 차단용 (최소 간격 600ms)
+  const GHOST_CLICK_GUARD_MS = 600;
   const [uiLang, setUiLang] = useState('en');
 
   const [invFilter, setInvFilter] = useState({ storage: 'All', labName: 'All', manufacturer: 'All', chemicalName: '', chemType: 'All' }); // 재고 현황 조회 필터
@@ -788,6 +832,7 @@ export default function App() {
   const adminActivityRef = useRef(Date.now());
   const staticDataLoadedRef = useRef(false);
   const noticesLoadedRef = useRef(false);
+  const requestActionLocksRef = useRef(new Set());
   const [isRealtimePaused, setIsRealtimePaused] = useState(false);
   const [networkState, setNetworkState] = useState(typeof navigator !== 'undefined' && navigator.onLine === false ? 'offline' : 'online');
   const [lastSyncAt, setLastSyncAt] = useState(null);
@@ -842,6 +887,25 @@ export default function App() {
     };
   }, [requests]);
 
+  const pendingRequestCompletenessSummary = useMemo(() => {
+    const summary = { completeCount: 0, incompleteCount: 0, missingFieldCounts: {} };
+    requestStatusSummary.pendingReqs.forEach((req) => {
+      const completeness = getRequestCompleteness(req);
+      if (completeness.isComplete) summary.completeCount += 1;
+      else summary.incompleteCount += 1;
+      completeness.missingFields.forEach((field) => {
+        summary.missingFieldCounts[field] = (summary.missingFieldCounts[field] || 0) + 1;
+      });
+    });
+    const topMissingField = Object.entries(summary.missingFieldCounts)
+      .sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+    return {
+      ...summary,
+      hasIncomplete: summary.incompleteCount > 0,
+      topMissingField,
+    };
+  }, [requestStatusSummary.pendingReqs]);
+
   const chemicalInfoMap = useMemo(() => new Map(chemicals.map((chemical) => [String(chemical?.name || ''), chemical])), [chemicals]);
 
   const expandedHistoryEntries = useMemo(() => expandHistoryEntries(history)
@@ -855,6 +919,59 @@ export default function App() {
   const historyStorageOptions = useMemo(() => Array.from(new Set(history.map((item) => item.storage).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'ko')), [history]);
 
   const publicStatusStorageOptions = useMemo(() => Array.from(new Set(inventory.map((item) => item.storage).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'ko')), [inventory]);
+
+  // 🔒 중복 승인 방어: UI 레벨 + ghost click 차단 + 상태 잠금을 한 곳에서 처리
+  const beginRequestAction = useCallback((requestId) => {
+    const key = String(requestId || '');
+    if (!key) return { ok: false, reason: 'invalid' };
+    const now = Date.now();
+    const lastAt = lastActionAtRef.current.get(key) || 0;
+    if (now - lastAt < GHOST_CLICK_GUARD_MS) {
+      // 같은 버튼에서 600ms 이내 두 번 이상 눌림 → 모바일 ghost click 가능성 → 무시
+      return { ok: false, reason: 'ghost' };
+    }
+    if (requestActionLocksRef.current.has(key)) {
+      return { ok: false, reason: 'locked' };
+    }
+    lastActionAtRef.current.set(key, now);
+    requestActionLocksRef.current.add(key);
+    setProcessingRequestIds(prev => {
+      if (prev.has(key)) return prev;
+      const next = new Set(prev);
+      next.add(key);
+      return next;
+    });
+    return { ok: true, key };
+  }, []);
+
+  const endRequestAction = useCallback((requestId) => {
+    const key = String(requestId || '');
+    if (!key) return;
+    requestActionLocksRef.current.delete(key);
+    setProcessingRequestIds(prev => {
+      if (!prev.has(key)) return prev;
+      const next = new Set(prev);
+      next.delete(key);
+      return next;
+    });
+  }, []);
+
+  const invalidateLiveFetchCaches = useCallback(() => {
+    requestFetchMetaRef.current = { scope: '', fetchedAt: 0 };
+    historyFetchMetaRef.current = { scope: '', fetchedAt: 0 };
+  }, []);
+
+  const fetchHistoryDocIdsByOriginalReqId = useCallback(async (originalReqId) => {
+    const ids = new Set(history.filter((item) => item.originalReqId === originalReqId).map((item) => item.id).filter(Boolean));
+    if (!originalReqId || isDemoMode || !db || !user) return [...ids];
+
+    const snapshot = await getDocs(query(
+      collection(db, 'artifacts', appId, 'public', 'data', 'history'),
+      where('originalReqId', '==', originalReqId)
+    ));
+    snapshot.docs.forEach((docSnap) => ids.add(docSnap.id));
+    return [...ids];
+  }, [appId, db, history, isDemoMode, user]);
 
   const getSuggestedShelves = useCallback((storage, labName, keyword = '') => {
     if (!storage || !labName) return [];
@@ -1430,424 +1547,532 @@ export default function App() {
   };
 
   const approveRequest = async (req) => {
-    const isCheckIn = req.type === 'IN';
-    const targetAmount = Number(req.amount);
-
-    if (!Number.isFinite(targetAmount) || targetAmount <= 0) {
-        showAlert('오류', '승인할 수량이 올바르지 않습니다.');
-        return;
+    if (!req?.id) return;
+    const requestActionKey = String(req.id);
+    const gate = beginRequestAction(req.id);
+    if (!gate.ok) {
+      if (gate.reason === 'locked') showAlert('안내', '이미 처리 중인 신청입니다. 잠시만 기다려주세요.');
+      // ghost click (reason === 'ghost') 은 사용자에게 알리지 않고 조용히 무시
+      return;
     }
 
-    const requested = getRequestedAllocations(req);
-    const invalidLegacyLines = requested.invalidLines || [];
-    const invalidRows = requested.invalidRows || [];
-    if (invalidRows.length > 0 || invalidLegacyLines.length > 0) {
+    // ✅ 방어선 1: 클라이언트 상태가 이미 APPROVED 이면 즉시 중단
+    if (req.status && req.status !== 'PENDING') {
+      endRequestAction(req.id);
+      showAlert('안내', `이미 ${req.status === 'APPROVED' ? '승인된' : '처리된'} 신청입니다.`);
+      return;
+    }
+
+    try {
+      const isCheckIn = req.type === 'IN';
+      const targetAmount = Number(req.amount);
+      const matchedChemical = findChemicalByAnyName(req.chemicalName);
+      const preparedReq = {
+        ...req,
+        chemicalName: String(req.chemicalName || '').trim(),
+        manufacturer: String(req.manufacturer || '').trim(),
+        amount: targetAmount,
+        unit: req.unit || 'L',
+        chemType: normalizeChemicalType(req.chemType) || getResolvedChemicalType(req, chemicals) || normalizeChemicalType(matchedChemical?.type || '') || '미지정',
+        cas: req.cas || matchedChemical?.cas || '-',
+        shelf: req.shelf || '미지정',
+      };
+
+      if (!preparedReq.chemicalName) {
+        showAlert('오류', '물질명을 입력해주세요.');
+        return;
+      }
+      if (!Number.isFinite(targetAmount) || targetAmount <= 0) {
+        showAlert('오류', '승인할 수량이 올바르지 않습니다.');
+        return;
+      }
+
+      const requested = getRequestedAllocations(preparedReq);
+      const invalidLegacyLines = requested.invalidLines || [];
+      const invalidRows = requested.invalidRows || [];
+      if (invalidRows.length > 0 || invalidLegacyLines.length > 0) {
         const detail = invalidRows.length > 0
-            ? `행 ${invalidRows.join(', ')}`
-            : invalidLegacyLines.join(', ');
+          ? `행 ${invalidRows.join(', ')}`
+          : invalidLegacyLines.join(', ');
         showAlert('오류', `선반 분할 입력 형식이 올바르지 않습니다.
 문제 항목: ${detail}`);
         return;
-    }
+      }
 
-    const manualAllocations = requested.allocations || [];
-    if (manualAllocations.length > 0) {
+      const manualAllocations = requested.allocations || [];
+      if (manualAllocations.length > 0) {
         const allocationTotal = manualAllocations.reduce((sum, item) => sum + Number(item.amount), 0);
         if (Math.abs(allocationTotal - targetAmount) > 0.000001) {
-            showAlert('오류', `선반 분할 합계(${allocationTotal}${req.unit || 'L'})가 총 수량(${targetAmount}${req.unit || 'L'})과 다릅니다.`);
-            return;
+          showAlert('오류', `선반 분할 합계(${allocationTotal}${preparedReq.unit || 'L'})가 총 수량(${targetAmount}${preparedReq.unit || 'L'})과 다릅니다.`);
+          return;
         }
-    }
+      }
 
-    const baseInventory = inventory.map(item => ({ ...item, amount: Number(item.amount) }));
-    let nextInventory = [...baseInventory];
-    let resolvedAllocations = [];
+      const baseInventory = inventory.map(item => ({ ...item, amount: Number(item.amount) }));
+      let nextInventory = [...baseInventory];
+      let resolvedAllocations = [];
 
-    const addResolved = (shelf, amount) => {
+      const addResolved = (shelf, amount) => {
         const normalizedShelf = shelf || '미지정';
         const existing = resolvedAllocations.find(item => item.shelf === normalizedShelf);
         if (existing) existing.amount += Number(amount);
         else resolvedAllocations.push({ shelf: normalizedShelf, amount: Number(amount) });
-    };
+      };
 
-    if (isCheckIn) {
-        resolvedAllocations = manualAllocations.length > 0 ? manualAllocations.map(item => ({ ...item })) : [{ shelf: req.shelf || '미지정', amount: targetAmount }];
+      if (isCheckIn) {
+        resolvedAllocations = manualAllocations.length > 0
+          ? manualAllocations.map(item => ({ ...item }))
+          : [{ shelf: preparedReq.shelf || '미지정', amount: targetAmount }];
+
         resolvedAllocations.forEach((allocation, index) => {
-            const shelf = allocation.shelf || '미지정';
-            const found = nextInventory.find(item =>
-                item.storage === req.storage &&
-                (item.shelf || '미지정') === shelf &&
-                item.chemicalName === req.chemicalName &&
-                item.labName === req.labName &&
-                item.manufacturer === req.manufacturer
-            );
-            if (found) {
-                found.amount = Number(found.amount) + Number(allocation.amount);
-            } else {
-                nextInventory.push({
-                    id: `NEW_IN_${index}_${Date.now()}`,
-                    storage: req.storage,
-                    shelf,
-                    chemicalName: req.chemicalName,
-                    type: req.chemType,
-                    amount: Number(allocation.amount),
-                    unit: req.unit,
-                    manufacturer: req.manufacturer,
-                    labName: req.labName,
-                    cas: req.cas || '-',
-                    bottleSize: req.bottleSize || 0,
-                    bottleUnit: req.bottleUnit || '',
-                    bottleCount: req.bottleCount || ''
-                });
-            }
+          const shelf = allocation.shelf || '미지정';
+          const found = nextInventory.find(item =>
+            item.storage === preparedReq.storage &&
+            (item.shelf || '미지정') === shelf &&
+            item.chemicalName === preparedReq.chemicalName &&
+            item.labName === preparedReq.labName &&
+            item.manufacturer === preparedReq.manufacturer
+          );
+          if (found) {
+            found.amount = Number(found.amount) + Number(allocation.amount);
+          } else {
+            nextInventory.push({
+              id: `NEW_IN_${index}_${Date.now()}`,
+              storage: preparedReq.storage,
+              shelf,
+              chemicalName: preparedReq.chemicalName,
+              type: preparedReq.chemType,
+              amount: Number(allocation.amount),
+              unit: preparedReq.unit,
+              manufacturer: preparedReq.manufacturer,
+              labName: preparedReq.labName,
+              cas: preparedReq.cas || '-',
+              bottleSize: preparedReq.bottleSize || 0,
+              bottleUnit: preparedReq.bottleUnit || '',
+              bottleCount: preparedReq.bottleCount || '',
+            });
+          }
         });
-    } else {
+      } else {
         let candidatePool = nextInventory.filter(item =>
-            item.storage === req.storage && item.chemicalName === req.chemicalName && item.labName === req.labName
+          item.storage === preparedReq.storage && item.chemicalName === preparedReq.chemicalName && item.labName === preparedReq.labName
         );
         if (candidatePool.length === 0) {
-            candidatePool = nextInventory.filter(item =>
-                item.storage === req.storage && item.chemicalName === req.chemicalName
-            );
+          candidatePool = nextInventory.filter(item =>
+            item.storage === preparedReq.storage && item.chemicalName === preparedReq.chemicalName
+          );
         }
         candidatePool = candidatePool.slice().sort((a, b) => String(a.shelf || '').localeCompare(String(b.shelf || ''), 'ko', { numeric: true }));
         if (candidatePool.length === 0) {
-            showAlert('실패', `해당 저장소에 ${req.chemicalName} 재고가 없습니다.
-[저장소: ${req.storage}]`);
-            return;
+          showAlert('실패', `해당 저장소에 ${preparedReq.chemicalName} 재고가 없습니다.
+[저장소: ${preparedReq.storage}]`);
+          return;
         }
 
         if (manualAllocations.length > 0) {
-            for (const allocation of manualAllocations) {
-                let remainingOnShelf = Number(allocation.amount);
-                const shelfMatches = candidatePool.filter(item => (item.shelf || '미지정') === (allocation.shelf || '미지정'));
-                if (shelfMatches.length === 0) {
-                    showAlert('실패', `${allocation.shelf} 선반에 출고 가능한 재고가 없습니다.`);
-                    return;
-                }
-                for (const item of shelfMatches) {
-                    if (remainingOnShelf <= 0) break;
-                    const usable = Math.min(Number(item.amount), remainingOnShelf);
-                    if (usable <= 0) continue;
-                    item.amount = Number(item.amount) - usable;
-                    remainingOnShelf -= usable;
-                    addResolved(allocation.shelf || '미지정', usable);
-                }
-                if (remainingOnShelf > 0) {
-                    showAlert('실패', `${allocation.shelf} 선반 재고가 부족합니다.`);
-                    return;
-                }
+          for (const allocation of manualAllocations) {
+            let remainingOnShelf = Number(allocation.amount);
+            const shelfMatches = candidatePool.filter(item => (item.shelf || '미지정') === (allocation.shelf || '미지정'));
+            if (shelfMatches.length === 0) {
+              showAlert('실패', `${allocation.shelf} 선반에 출고 가능한 재고가 없습니다.`);
+              return;
             }
+            for (const item of shelfMatches) {
+              if (remainingOnShelf <= 0) break;
+              const usable = Math.min(Number(item.amount), remainingOnShelf);
+              if (usable <= 0) continue;
+              item.amount = Number(item.amount) - usable;
+              remainingOnShelf -= usable;
+              addResolved(allocation.shelf || '미지정', usable);
+            }
+            if (remainingOnShelf > 0) {
+              showAlert('실패', `${allocation.shelf} 선반 재고가 부족합니다.`);
+              return;
+            }
+          }
         } else {
-            let remaining = targetAmount;
-            for (const item of candidatePool) {
-                if (remaining <= 0) break;
-                const usable = Math.min(Number(item.amount), remaining);
-                if (usable <= 0) continue;
-                item.amount = Number(item.amount) - usable;
-                remaining -= usable;
-                addResolved(item.shelf || '미지정', usable);
-            }
-            if (remaining > 0) {
-                showAlert('실패', '재고가 부족하여 출고할 수 없습니다.');
-                return;
-            }
+          let remaining = targetAmount;
+          for (const item of candidatePool) {
+            if (remaining <= 0) break;
+            const usable = Math.min(Number(item.amount), remaining);
+            if (usable <= 0) continue;
+            item.amount = Number(item.amount) - usable;
+            remaining -= usable;
+            addResolved(item.shelf || '미지정', usable);
+          }
+          if (remaining > 0) {
+            showAlert('실패', '재고가 부족하여 출고할 수 없습니다.');
+            return;
+          }
         }
         nextInventory = nextInventory.filter(item => Number(item.amount) > 0);
-    }
+      }
 
-    const normalizedReq = {
-        ...req,
+      const normalizedReq = {
+        ...preparedReq,
         amount: targetAmount,
         shelfAllocations: resolvedAllocations,
-        shelf: resolvedAllocations.map(item => item.shelf).join(', ') || (req.shelf || '미지정'),
+        shelf: resolvedAllocations.map(item => item.shelf).join(', ') || (preparedReq.shelf || '미지정'),
         inventoryLocked: false,
-    };
+      };
 
-    if (req.inventoryLocked) {
-        const processedAt = Date.now();
-        const historyEntries = buildHistoryEntriesFromRequest(normalizedReq, {
-            actionDate: req.actionDate || getTodayString(),
-            status: 'APPROVED',
-            processedAt,
-            originalReqId: req.id,
-            inventoryUpdated: false,
-        });
+      const processedAt = Date.now();
+      const historyEntries = buildHistoryEntriesFromRequest(normalizedReq, {
+        actionDate: preparedReq.actionDate || getTodayString(),
+        status: 'APPROVED',
+        cas: preparedReq.cas || '-',
+        originalReqId: preparedReq.id,
+        processedAt,
+        inventoryUpdated: !preparedReq.inventoryLocked,
+      });
+
+      if (preparedReq.inventoryLocked) {
         if (isDemoMode) {
-            setRequests(requests.map(r => r.id === req.id ? { ...r, ...normalizedReq, status: 'APPROVED', recycledAt: null } : r));
-            setHistory([...historyEntries, ...history.filter(h => h.originalReqId !== req.id)]);
-            showAlert('완료', '재고 변경 없이 승인 상태만 갱신했습니다.');
-            return;
+          setRequests(requests.map(r => r.id === preparedReq.id ? { ...r, ...normalizedReq, status: 'APPROVED', recycledAt: null, inventoryLocked: true } : r));
+          setHistory([...historyEntries, ...history.filter(h => h.originalReqId !== preparedReq.id)]);
+          invalidateLiveFetchCaches();
+          showAlert('완료', '재고 변경 없이 승인 상태만 갱신했습니다.');
+          return;
         }
+
         try {
-            const batch = writeBatch(db);
-            const reqRef = doc(db, 'artifacts', appId, 'public', 'data', 'requests', req.id);
-            batch.update(reqRef, {
-                status: 'APPROVED',
-                shelf: normalizedReq.shelf,
-                shelfAllocations: normalizedReq.shelfAllocations,
-                recycledAt: deleteField(),
+          const historyDocIds = await fetchHistoryDocIdsByOriginalReqId(preparedReq.id);
+          const reqRef = doc(db, 'artifacts', appId, 'public', 'data', 'requests', preparedReq.id);
+
+          await runTransaction(db, async (tx) => {
+            const snap = await tx.get(reqRef);
+            if (!snap.exists()) throw new Error('REQUEST_NOT_FOUND');
+            const currentStatus = snap.data()?.status;
+            // 재고 유지 승인은 이미 APPROVED인 상태에서도 재실행이 가능해야 함 (recycle 후 재승인 포함)
+            // 단, 동시에 두 번 들어오는 것은 막아야 하므로 processedAt 비교로 중복 commit 방지
+            const prevProcessedAt = snap.data()?.processedAt || 0;
+            if (prevProcessedAt === processedAt) {
+              throw new Error('ALREADY_PROCESSED');
+            }
+            tx.update(reqRef, {
+              status: 'APPROVED',
+              shelf: normalizedReq.shelf,
+              shelfAllocations: normalizedReq.shelfAllocations,
+              recycledAt: deleteField(),
+              processedAt,
             });
-            history.filter(h => h.originalReqId === req.id).forEach(h => {
-                batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', h.id));
+            historyDocIds.forEach((historyId) => {
+              tx.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', historyId));
             });
             historyEntries.forEach((entry) => {
-                const histRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'history'));
-                const { id: _tempId, ...payload } = entry;
-                batch.set(histRef, payload);
+              const histRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'history'));
+              const { id: _tempId, ...payload } = entry;
+              tx.set(histRef, payload);
             });
-            await batch.commit();
-            setRequests(prev => prev.map(r => r.id === req.id ? { ...r, ...normalizedReq, status: 'APPROVED', recycledAt: null } : r));
-            setHistory(prev => [...historyEntries, ...prev.filter(h => h.originalReqId !== req.id)]);
-            showAlert('완료', '재고 변경 없이 승인 상태만 갱신했습니다.');
-            return;
+          });
+
+          setRequests(prev => prev.map(r => r.id === preparedReq.id ? { ...r, ...normalizedReq, status: 'APPROVED', recycledAt: null, inventoryLocked: true } : r));
+          setHistory(prev => [...historyEntries, ...prev.filter(h => h.originalReqId !== preparedReq.id)]);
+          invalidateLiveFetchCaches();
+          showAlert('완료', '재고 변경 없이 승인 상태만 갱신했습니다.');
+          return;
         } catch (e) {
-            console.error(e);
+          console.error(e);
+          if (e?.message === 'ALREADY_PROCESSED') {
+            showAlert('안내', '이미 처리된 신청입니다.');
+          } else if (e?.message === 'REQUEST_NOT_FOUND') {
+            showAlert('안내', '해당 신청이 이미 삭제되었습니다.');
+          } else {
             showAlert('오류', '재승인 처리 중 문제가 발생했습니다.');
-            return;
+          }
+          return;
         }
-    }
+      }
 
-    if (isDemoMode) {
-        const processedAt = Date.now();
-        const historyEntries = buildHistoryEntriesFromRequest(normalizedReq, {
-            actionDate: req.actionDate || getTodayString(),
-            status: 'APPROVED',
-            processedAt,
-            originalReqId: req.id,
-            inventoryUpdated: true,
-        });
+      if (isDemoMode) {
         setInventory(nextInventory);
-        setRequests(requests.map(r => r.id === req.id ? { ...r, ...normalizedReq, status: 'APPROVED', recycledAt: null } : r));
-        setHistory([...historyEntries, ...history.filter(h => h.originalReqId !== req.id)]);
+        setRequests(requests.map(r => r.id === preparedReq.id ? { ...r, ...normalizedReq, status: 'APPROVED', recycledAt: null } : r));
+        setHistory([...historyEntries, ...history.filter(h => h.originalReqId !== preparedReq.id)]);
+        invalidateLiveFetchCaches();
+        showAlert('완료', '신청이 승인되고 재고/기록이 반영되었습니다.');
         return;
-    }
+      }
 
-    try {
-        const batch = writeBatch(db);
-        const nextMap = new Map(nextInventory.filter(item => !String(item.id).startsWith('NEW_IN_')).map(item => [String(item.id), Number(item.amount)]));
+      try {
+        const historyDocIds = await fetchHistoryDocIdsByOriginalReqId(preparedReq.id);
+        const reqRef = doc(db, 'artifacts', appId, 'public', 'data', 'requests', preparedReq.id);
 
-        inventory.forEach((item) => {
+        // ✅ 방어선 4: Firestore 트랜잭션으로 상태를 읽어서 PENDING일 때만 갱신
+        // → 두 번째 호출이 여기까지 와도 트랜잭션이 '이미 APPROVED'를 감지하고 거부
+        await runTransaction(db, async (tx) => {
+          const snap = await tx.get(reqRef);
+          if (!snap.exists()) {
+            throw new Error('REQUEST_NOT_FOUND');
+          }
+          const currentStatus = snap.data()?.status;
+          if (currentStatus && currentStatus !== 'PENDING') {
+            throw new Error('ALREADY_PROCESSED');
+          }
+
+          // 재고 업데이트 (기존 문서 차감/삭제)
+          const nextMap = new Map(nextInventory.filter(item => !String(item.id).startsWith('NEW_IN_')).map(item => [String(item.id), Number(item.amount)]));
+          inventory.forEach((item) => {
             const currentAmount = Number(item.amount);
             const newAmount = nextMap.has(String(item.id)) ? Number(nextMap.get(String(item.id))) : 0;
             if (newAmount === currentAmount) return;
             const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'inventory', item.id);
-            if (newAmount <= 0) batch.delete(docRef);
-            else batch.update(docRef, { amount: newAmount });
-        });
+            if (newAmount <= 0) tx.delete(docRef);
+            else tx.update(docRef, { amount: newAmount });
+          });
 
-        nextInventory.filter(item => String(item.id).startsWith('NEW_IN_')).forEach((item) => {
+          // 새 재고 문서 (반입의 경우)
+          nextInventory.filter(item => String(item.id).startsWith('NEW_IN_')).forEach((item) => {
             const docRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'inventory'));
-            batch.set(docRef, {
-                storage: item.storage,
-                shelf: item.shelf,
-                chemicalName: item.chemicalName,
-                type: item.type,
-                amount: Number(item.amount),
-                unit: item.unit,
-                manufacturer: item.manufacturer,
-                labName: item.labName,
-                cas: item.cas || '-',
-                bottleSize: item.bottleSize || 0,
-                bottleUnit: item.bottleUnit || '',
-                bottleCount: item.bottleCount || ''
+            tx.set(docRef, {
+              storage: item.storage,
+              shelf: item.shelf,
+              chemicalName: item.chemicalName,
+              type: item.type,
+              amount: Number(item.amount),
+              unit: item.unit,
+              manufacturer: item.manufacturer,
+              labName: item.labName,
+              cas: item.cas || '-',
+              bottleSize: item.bottleSize || 0,
+              bottleUnit: item.bottleUnit || '',
+              bottleCount: item.bottleCount || '',
             });
-        });
+          });
 
-        const reqRef = doc(db, 'artifacts', appId, 'public', 'data', 'requests', req.id);
-        batch.update(reqRef, {
+          // 요청 상태를 APPROVED로 갱신 (트랜잭션 내부이므로 경쟁조건 없음)
+          tx.update(reqRef, {
             status: 'APPROVED',
             shelf: normalizedReq.shelf,
             shelfAllocations: normalizedReq.shelfAllocations,
             recycledAt: deleteField(),
             inventoryLocked: deleteField(),
-        });
-
-        history.filter(h => h.originalReqId === req.id).forEach(h => {
-            batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', h.id));
-        });
-
-        const processedAt = Date.now();
-        const historyEntries = buildHistoryEntriesFromRequest(normalizedReq, {
-            actionDate: req.actionDate || getTodayString(),
-            status: 'APPROVED',
-            cas: req.cas || '-',
-            originalReqId: req.id,
             processedAt,
-            inventoryUpdated: true,
-        });
+          });
 
-        historyEntries.forEach((entry) => {
+          // 기존 히스토리 삭제 + 새 히스토리 기록
+          historyDocIds.forEach((historyId) => {
+            tx.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', historyId));
+          });
+          historyEntries.forEach((entry) => {
             const histRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'history'));
             const { id: _tempId, ...payload } = entry;
-            batch.set(histRef, payload);
+            tx.set(histRef, payload);
+          });
         });
 
-        await batch.commit();
         setInventory(nextInventory);
-        setRequests(prev => prev.map(r => r.id === req.id ? { ...r, ...normalizedReq, status: 'APPROVED', recycledAt: null } : r));
-        setHistory(prev => [...historyEntries, ...prev.filter(h => h.originalReqId !== req.id)]);
-    } catch (e) {
+        setRequests(prev => prev.map(r => r.id === preparedReq.id ? { ...r, ...normalizedReq, status: 'APPROVED', recycledAt: null } : r));
+        setHistory(prev => [...historyEntries, ...prev.filter(h => h.originalReqId !== preparedReq.id)]);
+        invalidateLiveFetchCaches();
+        showAlert('완료', '신청이 승인되고 재고/기록이 반영되었습니다.');
+      } catch (e) {
         console.error(e);
-        showAlert('오류', '처리 중 문제가 발생했습니다.');
+        if (e?.message === 'ALREADY_PROCESSED') {
+          // 다른 탭 또는 직전 호출이 이미 승인 완료한 경우
+          invalidateLiveFetchCaches();
+          showAlert('안내', '이미 다른 요청으로 승인 처리된 신청입니다. 목록을 새로고침합니다.');
+          loadRequestsOnce({ force: true, includeRecent: approvalViewTab === 'all' });
+        } else if (e?.message === 'REQUEST_NOT_FOUND') {
+          showAlert('안내', '해당 신청이 이미 삭제되었습니다.');
+          loadRequestsOnce({ force: true, includeRecent: approvalViewTab === 'all' });
+        } else {
+          showAlert('오류', '처리 중 문제가 발생했습니다.');
+        }
+      }
+    } finally {
+      endRequestAction(req.id);
     }
   };
 
   const rejectRequest = async (id) => {
       const req = requests.find(r => r.id === id);
       if (!req) return;
-      const updatedRequest = {
-          ...req,
-          status: 'REJECTED',
-          processedAt: Date.now(),
-          actionDate: req.actionDate || getTodayString(),
-          originalReqId: req.id,
-      };
-      if (isDemoMode) {
-          setRequests(requests.map(r => r.id === id ? updatedRequest : r));
-          setHistory(prev => prev.filter(h => h.originalReqId !== id && h.status !== 'REJECTED'));
-          showAlert('완료', '신청이 반려 처리되었으며 반출입 기록에는 반영되지 않습니다.');
+      const gate = beginRequestAction(id);
+      if (!gate.ok) {
+          if (gate.reason === 'locked') showAlert('안내', '이미 처리 중인 신청입니다. 잠시만 기다려주세요.');
+          return;
+      }
+      if (req.status && req.status !== 'PENDING') {
+          endRequestAction(id);
+          showAlert('안내', '이미 처리된 신청입니다.');
           return;
       }
       try {
-          const batch = writeBatch(db);
-          batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'requests', id), {
+          const processedAt = Date.now();
+          const updatedRequest = {
+              ...req,
               status: 'REJECTED',
-              processedAt: updatedRequest.processedAt,
-          });
-          history.filter(h => h.originalReqId === id).forEach(h => {
-              batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', h.id));
-          });
-          await batch.commit();
-          setRequests(prev => prev.map(r => r.id === id ? updatedRequest : r));
-          setHistory(prev => prev.filter(h => h.originalReqId !== id && h.status !== 'REJECTED'));
-          showAlert('완료', '신청이 반려 처리되었으며 반출입 기록에는 반영되지 않습니다.');
-      } catch (e) {
-          console.error(e);
-          showAlert("오류", "반려 처리 실패");
+              processedAt,
+              actionDate: req.actionDate || getTodayString(),
+              originalReqId: req.id,
+          };
+          if (isDemoMode) {
+              setRequests(requests.map(r => r.id === id ? updatedRequest : r));
+              setHistory(prev => prev.filter(h => h.originalReqId !== id && h.status !== 'REJECTED'));
+              invalidateLiveFetchCaches();
+              showAlert('완료', '신청이 반려 처리되었으며 반출입 기록에는 반영되지 않습니다.');
+              return;
+          }
+          try {
+              const historyDocIds = await fetchHistoryDocIdsByOriginalReqId(id);
+              const batch = writeBatch(db);
+              batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'requests', id), {
+                  status: 'REJECTED',
+                  processedAt,
+              });
+              historyDocIds.forEach((historyId) => {
+                  batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', historyId));
+              });
+              await batch.commit();
+              setRequests(prev => prev.map(r => r.id === id ? updatedRequest : r));
+              setHistory(prev => prev.filter(h => h.originalReqId !== id && h.status !== 'REJECTED'));
+              invalidateLiveFetchCaches();
+              showAlert('완료', '신청이 반려 처리되었으며 반출입 기록에는 반영되지 않습니다.');
+          } catch (e) {
+              console.error(e);
+              showAlert('오류', '반려 처리 실패');
+          }
+      } finally {
+          endRequestAction(id);
       }
   };
 
   const recycleRequestToPending = async (req) => {
-      const rollbackAmount = Number(req.amount);
-      const rollbackAllocations = Array.isArray(req.shelfAllocations) && req.shelfAllocations.length > 0
-          ? req.shelfAllocations
-          : [{ shelf: req.shelf || '미지정', amount: rollbackAmount }];
-      const updated = {
-          ...req,
-          status: 'PENDING',
-          inventoryLocked: false,
-          recycledAt: Date.now()
-      };
+      if (!req?.id) return;
+      const requestActionKey = String(req.id);
+      if (requestActionLocksRef.current.has(requestActionKey)) {
+          showAlert('안내', '이미 처리 중인 신청입니다. 잠시만 기다려주세요.');
+          return;
+      }
+      requestActionLocksRef.current.add(requestActionKey);
+      try {
+          const rollbackAmount = Number(req.amount);
+          const rollbackAllocations = Array.isArray(req.shelfAllocations) && req.shelfAllocations.length > 0
+              ? req.shelfAllocations
+              : [{ shelf: req.shelf || '미지정', amount: rollbackAmount }];
+          const updated = {
+              ...req,
+              status: 'PENDING',
+              inventoryLocked: false,
+              recycledAt: Date.now()
+          };
+          delete updated.processedAt;
 
-      const buildRolledBackInventory = () => {
-          let newInv = inventory.map(item => ({ ...item, amount: Number(item.amount) }));
-          if (req.status !== 'APPROVED') return newInv;
+          const buildRolledBackInventory = () => {
+              let newInv = inventory.map(item => ({ ...item, amount: Number(item.amount) }));
+              if (req.status !== 'APPROVED') return newInv;
 
-          if (req.type === 'IN') {
-              rollbackAllocations.forEach(allocation => {
-                  newInv = newInv.map(item => {
-                      if (
+              if (req.type === 'IN') {
+                  rollbackAllocations.forEach(allocation => {
+                      newInv = newInv.map(item => {
+                          if (
+                              item.storage === req.storage &&
+                              (item.shelf || '미지정') === (allocation.shelf || '미지정') &&
+                              item.chemicalName === req.chemicalName &&
+                              item.labName === req.labName &&
+                              item.manufacturer === req.manufacturer
+                          ) {
+                              return { ...item, amount: Number(item.amount) - Number(allocation.amount) };
+                          }
+                          return item;
+                      }).filter(item => Number(item.amount) > 0);
+                  });
+              } else {
+                  rollbackAllocations.forEach(allocation => {
+                      const idx = newInv.findIndex(item =>
                           item.storage === req.storage &&
                           (item.shelf || '미지정') === (allocation.shelf || '미지정') &&
                           item.chemicalName === req.chemicalName &&
-                          item.labName === req.labName &&
-                          item.manufacturer === req.manufacturer
-                      ) {
-                          return { ...item, amount: Number(item.amount) - Number(allocation.amount) };
+                          item.labName === req.labName
+                      );
+                      if (idx >= 0) {
+                          newInv[idx] = { ...newInv[idx], amount: Number(newInv[idx].amount) + Number(allocation.amount) };
+                      } else {
+                          newInv.push({
+                              id: `ROLLBACK_${Date.now()}_${allocation.shelf}`,
+                              storage: req.storage,
+                              shelf: allocation.shelf || '미지정',
+                              chemicalName: req.chemicalName,
+                              type: req.chemType || '미지정',
+                              amount: Number(allocation.amount),
+                              unit: req.unit,
+                              manufacturer: req.manufacturer || '',
+                              labName: req.labName,
+                              cas: req.cas || '-'
+                          });
                       }
-                      return item;
-                  }).filter(item => Number(item.amount) > 0);
-              });
-          } else {
-              rollbackAllocations.forEach(allocation => {
-                  const idx = newInv.findIndex(item =>
-                      item.storage === req.storage &&
-                      (item.shelf || '미지정') === (allocation.shelf || '미지정') &&
-                      item.chemicalName === req.chemicalName &&
-                      item.labName === req.labName
-                  );
-                  if (idx >= 0) {
-                      newInv[idx] = { ...newInv[idx], amount: Number(newInv[idx].amount) + Number(allocation.amount) };
-                  } else {
-                      newInv.push({
-                          id: `ROLLBACK_${Date.now()}_${allocation.shelf}`,
-                          storage: req.storage,
-                          shelf: allocation.shelf || '미지정',
-                          chemicalName: req.chemicalName,
-                          type: req.chemType || '미지정',
-                          amount: Number(allocation.amount),
-                          unit: req.unit,
-                          manufacturer: req.manufacturer || '',
-                          labName: req.labName,
-                          cas: req.cas || '-'
-                      });
-                  }
-              });
+                  });
+              }
+              return newInv;
+          };
+
+          const rolledBackInventory = buildRolledBackInventory();
+
+          if (isDemoMode) {
+              setInventory(rolledBackInventory);
+              setRequests(prev => prev.map(r => r.id === req.id ? updated : r));
+              setHistory(prev => prev.filter(h => h.originalReqId !== req.id));
+              invalidateLiveFetchCaches();
+              setEditingRequest(toEditableRequest(updated));
+              setApprovalViewTab('pending');
+              showAlert('완료', req.status === 'APPROVED' ? '재고를 롤백하고 승인 대기로 이동했습니다. 수정 후 다시 승인할 수 있습니다.' : '항목이 승인 대기로 이동되었습니다.');
+              return;
           }
-          return newInv;
-      };
 
-      const rolledBackInventory = buildRolledBackInventory();
+          try {
+              const historyDocIds = await fetchHistoryDocIdsByOriginalReqId(req.id);
+              const batch = writeBatch(db);
+              const nextMap = new Map(rolledBackInventory.filter(item => !String(item.id).startsWith('ROLLBACK_')).map(item => [String(item.id), Number(item.amount)]));
 
-      if (isDemoMode) {
-          setInventory(rolledBackInventory);
-          setRequests(prev => prev.map(r => r.id === req.id ? updated : r));
-          setHistory(prev => prev.filter(h => h.originalReqId !== req.id));
-          setEditingRequest(toEditableRequest(updated));
-          setApprovalViewTab('pending');
-          showAlert('완료', req.status === 'APPROVED' ? '재고를 롤백하고 승인 대기로 이동했습니다. 수정 후 다시 승인할 수 있습니다.' : '항목이 승인 대기로 이동되었습니다.');
-          return;
-      }
-
-      try {
-          const batch = writeBatch(db);
-          const nextMap = new Map(rolledBackInventory.filter(item => !String(item.id).startsWith('ROLLBACK_')).map(item => [String(item.id), Number(item.amount)]));
-
-          inventory.forEach((item) => {
-              const currentAmount = Number(item.amount);
-              const newAmount = nextMap.has(String(item.id)) ? Number(nextMap.get(String(item.id))) : 0;
-              if (newAmount === currentAmount) return;
-              const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'inventory', item.id);
-              if (newAmount <= 0) batch.delete(docRef);
-              else batch.update(docRef, { amount: newAmount });
-          });
-
-          rolledBackInventory.filter(item => String(item.id).startsWith('ROLLBACK_')).forEach((item) => {
-              const docRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'inventory'));
-              batch.set(docRef, {
-                  storage: item.storage,
-                  shelf: item.shelf,
-                  chemicalName: item.chemicalName,
-                  type: item.type,
-                  amount: Number(item.amount),
-                  unit: item.unit,
-                  manufacturer: item.manufacturer || '',
-                  labName: item.labName,
-                  cas: item.cas || '-'
+              inventory.forEach((item) => {
+                  const currentAmount = Number(item.amount);
+                  const newAmount = nextMap.has(String(item.id)) ? Number(nextMap.get(String(item.id))) : 0;
+                  if (newAmount === currentAmount) return;
+                  const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'inventory', item.id);
+                  if (newAmount <= 0) batch.delete(docRef);
+                  else batch.update(docRef, { amount: newAmount });
               });
-          });
 
-          batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'requests', req.id), {
-              status: 'PENDING',
-              recycledAt: Date.now(),
-              inventoryLocked: deleteField()
-          });
+              rolledBackInventory.filter(item => String(item.id).startsWith('ROLLBACK_')).forEach((item) => {
+                  const docRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'inventory'));
+                  batch.set(docRef, {
+                      storage: item.storage,
+                      shelf: item.shelf,
+                      chemicalName: item.chemicalName,
+                      type: item.type,
+                      amount: Number(item.amount),
+                      unit: item.unit,
+                      manufacturer: item.manufacturer || '',
+                      labName: item.labName,
+                      cas: item.cas || '-'
+                  });
+              });
 
-          history.filter(h => h.originalReqId === req.id).forEach(h => {
-              batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', h.id));
-          });
+              batch.update(doc(db, 'artifacts', appId, 'public', 'data', 'requests', req.id), {
+                  status: 'PENDING',
+                  recycledAt: updated.recycledAt,
+                  processedAt: deleteField(),
+                  inventoryLocked: deleteField()
+              });
 
-          await batch.commit();
-          setInventory(rolledBackInventory);
-          setRequests(prev => prev.map(r => r.id === req.id ? updated : r));
-          setHistory(prev => prev.filter(h => h.originalReqId !== req.id));
-          setEditingRequest(toEditableRequest(updated));
-          setApprovalViewTab('pending');
-          showAlert('완료', req.status === 'APPROVED' ? '재고를 롤백하고 승인 대기로 이동했습니다. 수정 후 다시 승인할 수 있습니다.' : '항목이 승인 대기로 이동되었습니다.');
-      } catch (e) {
-          console.error(e);
-          showAlert('오류', '롤백 후 승인 대기로 이동하지 못했습니다.');
+              historyDocIds.forEach((historyId) => {
+                  batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', historyId));
+              });
+
+              await batch.commit();
+              setInventory(rolledBackInventory);
+              setRequests(prev => prev.map(r => r.id === req.id ? updated : r));
+              setHistory(prev => prev.filter(h => h.originalReqId !== req.id));
+              invalidateLiveFetchCaches();
+              setEditingRequest(toEditableRequest(updated));
+              setApprovalViewTab('pending');
+              showAlert('완료', req.status === 'APPROVED' ? '재고를 롤백하고 승인 대기로 이동했습니다. 수정 후 다시 승인할 수 있습니다.' : '항목이 승인 대기로 이동되었습니다.');
+          } catch (e) {
+              console.error(e);
+              showAlert('오류', '롤백 후 승인 대기로 이동하지 못했습니다.');
+          }
+      } finally {
+          requestActionLocksRef.current.delete(requestActionKey);
       }
   };
 
@@ -1924,14 +2149,16 @@ export default function App() {
             return;
         }
         try {
+            const historyDocIds = await fetchHistoryDocIdsByOriginalReqId(req.id);
             const batch = writeBatch(db);
             batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'requests', req.id));
-            history.filter(h => h.originalReqId === req.id).forEach(h => {
-                batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', h.id));
+            historyDocIds.forEach((historyId) => {
+                batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', historyId));
             });
             await batch.commit();
             setRequests(nextRequests);
             setHistory(nextHistory);
+            invalidateLiveFetchCaches();
             showAlert('성공', '대기 중 신청이 삭제되었습니다.');
         } catch(e) {
             console.error(e);
@@ -1952,6 +2179,7 @@ export default function App() {
             return;
         }
         try {
+            const historyDocIds = await fetchHistoryDocIdsByOriginalReqId(req.id);
             const batch = writeBatch(db);
             if (req.status === 'APPROVED' && !req.inventoryLocked) {
                 const nextMap = new Map(nextInventory.filter(item => !String(item.id).startsWith('ROLLBACK_')).map(item => [String(item.id), Number(item.amount)]));
@@ -1981,13 +2209,14 @@ export default function App() {
             }
 
             batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'requests', req.id));
-            history.filter(h => h.originalReqId === req.id).forEach(h => {
-                batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', h.id));
+            historyDocIds.forEach((historyId) => {
+                batch.delete(doc(db, 'artifacts', appId, 'public', 'data', 'history', historyId));
             });
             await batch.commit();
             setInventory(nextInventory.filter(item => Number(item.amount) > 0));
             setRequests(nextRequests);
             setHistory(nextHistory);
+            invalidateLiveFetchCaches();
             showAlert("성공", req.inventoryLocked ? "기록이 삭제되었습니다." : "데이터가 롤백되어 삭제되었습니다.");
         } catch (e) {
             console.error(e);
@@ -2993,12 +3222,21 @@ export default function App() {
     </div>
   );
 
-  const NavItem = ({ tab, icon: Icon, label, badge }) => (
+  const NavItem = ({ tab, icon: Icon, label, badge, badgeTone = 'orange' }) => {
+      const badgeClassMap = {
+          orange: 'bg-orange-500 text-white',
+          rose: 'bg-rose-100 text-rose-700 border border-rose-200',
+          emerald: 'bg-emerald-100 text-emerald-700 border border-emerald-200',
+          slate: 'bg-slate-100 text-slate-600 border border-slate-200',
+      };
+      const badgeClass = badgeClassMap[badgeTone] || badgeClassMap.orange;
+      return (
       <button onClick={() => navigateTo(tab)} className={`w-full text-left px-4 py-3 rounded-lg flex items-center justify-between group transition ${activeTab === tab ? 'bg-blue-600/20 text-blue-400 border border-blue-500/30' : 'hover:bg-slate-800 text-slate-300'}`}>
           <div className="flex items-center gap-3"><Icon size={18} className={activeTab === tab ? 'text-blue-400' : 'text-slate-400'}/> <span className="font-medium">{label}</span></div>
-          {badge > 0 && <span className="bg-orange-500 text-white text-xs font-bold px-2 py-0.5 rounded-full">{badge}</span>}
+          {badge > 0 && <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${badgeClass}`}>{badge}</span>}
       </button>
   );
+  };
 
   const renderSidebar = () => (
     <>
@@ -3036,7 +3274,7 @@ export default function App() {
               <NavItem tab="dashboard" icon={LayoutDashboard} label="대시보드" />
               <NavItem tab="notices" icon={Megaphone} label="공지사항 관리" badge={notices.filter(n=>n.important).length} />
               <NavItem tab="admin_inventory" icon={ClipboardList} label="재고 현황" />
-              <NavItem tab="approvals" icon={CheckCircle} label="승인 대기/관리" badge={requestStatusSummary.pendingCount} />
+              <NavItem tab="approvals" icon={CheckCircle} label="승인 대기/관리" badge={requestStatusSummary.pendingCount} badgeTone={requestStatusSummary.pendingCount === 0 ? 'slate' : pendingRequestCompletenessSummary.hasIncomplete ? 'rose' : 'emerald'} />
               <NavItem tab="history" icon={ArrowRightLeft} label="반출입 기록 조회" />
               <NavItem tab="masterData" icon={Database} label="기초 데이터 관리" />
             </>
@@ -3991,15 +4229,15 @@ export default function App() {
   };
 
   // 승인화면 Firebase 저장 헬퍼
-  const saveEditedRequest = async (updated) => {
+  const saveEditedRequest = async (updated, { approveAfterSave = false } = {}) => {
     const normalizedAmount = Number(updated.amount);
     if (!updated.chemicalName?.trim()) {
       showAlert("오류", "물질명을 입력해주세요.");
-      return;
+      return false;
     }
     if (!Number.isFinite(normalizedAmount) || normalizedAmount <= 0) {
       showAlert("오류", "수량은 0보다 큰 숫자여야 합니다.");
-      return;
+      return false;
     }
 
     const normalized = {
@@ -4018,7 +4256,7 @@ export default function App() {
       const detail = invalidRows.length > 0 ? `행 ${invalidRows.join(', ')}` : invalidLegacyLines.join(', ');
       showAlert("오류", `선반 분할 입력 형식이 올바르지 않습니다.
 문제 항목: ${detail}`);
-      return;
+      return false;
     }
 
     const allocations = requested.allocations || [];
@@ -4026,7 +4264,7 @@ export default function App() {
       const totalAllocated = allocations.reduce((sum, item) => sum + Number(item.amount), 0);
       if (Math.abs(totalAllocated - normalizedAmount) > 0.000001) {
         showAlert("오류", `선반 분할 합계(${totalAllocated}${normalized.unit || 'L'})가 총 수량(${normalizedAmount}${normalized.unit || 'L'})과 다릅니다.`);
-        return;
+        return false;
       }
       normalized.shelfAllocations = allocations;
       normalized.shelf = allocations.map(item => item.shelf).join(', ');
@@ -4040,17 +4278,29 @@ export default function App() {
     if (isDemoMode) {
       setRequests(prev => prev.map(r => r.id === normalized.id ? normalized : r));
       setEditingRequest(null);
+      invalidateLiveFetchCaches();
+      if (approveAfterSave) {
+        await approveRequest(normalized);
+        return true;
+      }
       showAlert("완료", "신청 내역이 수정되었습니다.");
-      return;
+      return true;
     }
 
     try {
       await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'requests', normalized.id), normalized);
       setRequests(prev => prev.map(r => r.id === normalized.id ? normalized : r));
       setEditingRequest(null);
+      invalidateLiveFetchCaches();
+      if (approveAfterSave) {
+        await approveRequest(normalized);
+        return true;
+      }
       showAlert("완료", "신청 내역이 수정되었습니다.");
+      return true;
     } catch(e) {
       showAlert("오류", "수정 저장 실패");
+      return false;
     }
   };
 
@@ -4099,10 +4349,25 @@ export default function App() {
   const renderApprovalScreen = () => {
     const pendingReqs = requestStatusSummary.pendingReqs;
     const allReqs = requests;
-    // approvalViewTab은 이제 컴포넌트 레벨 state 사용 (훅 위반 수정)
-    const displayReqs = (approvalViewTab === 'pending' ? pendingReqs : allReqs)
+    const pendingReqRows = pendingReqs.map((req) => ({ req, completeness: getRequestCompleteness(req) }));
+    const allReqRows = allReqs.map((req) => ({ req, completeness: getRequestCompleteness(req) }));
+    const baseReqRows = approvalViewTab === 'pending' ? pendingReqRows : allReqRows;
+    const pendingIncompleteCount = pendingReqRows.filter(({ completeness }) => !completeness.isComplete).length;
+    const pendingCompleteCount = pendingReqRows.filter(({ completeness }) => completeness.isComplete).length;
+    const displayReqs = baseReqRows
+      .filter(({ completeness }) => {
+        if (approvalQuickFilter === 'needs_attention') return !completeness.isComplete;
+        if (approvalQuickFilter === 'complete') return completeness.isComplete;
+        return true;
+      })
       .slice()
-      .sort((a, b) => String(b.actionDate || '').localeCompare(String(a.actionDate || '')) || ((b.createdAt || 0) - (a.createdAt || 0)));
+      .sort((a, b) => {
+        if (approvalViewTab === 'pending') {
+          const completenessCompare = Number(a.completeness.isComplete) - Number(b.completeness.isComplete);
+          if (completenessCompare !== 0) return completenessCompare;
+        }
+        return String(b.req.actionDate || '').localeCompare(String(a.req.actionDate || '')) || ((b.req.createdAt || 0) - (a.req.createdAt || 0));
+      });
     const approvedCount = requestStatusSummary.approvedCount;
     const rejectedCount = requestStatusSummary.rejectedCount;
     const allocationDraftRows = editingRequest ? getEditableAllocationRows(editingRequest) : [];
@@ -4115,6 +4380,13 @@ export default function App() {
       : [...chemicals].sort((a,b) => String(a.name || '').localeCompare(String(b.name || ''), 'ko'));
     const allocationDraftTotal = allocationDraftRows.reduce((sum, row) => sum + (Number(row.amount) || 0), 0);
     const allocationDraftRemaining = (Number(editingRequest?.amount) || 0) - allocationDraftTotal;
+    const editingRequestCompleteness = editingRequest ? getRequestCompleteness(editingRequest) : null;
+    const approvalTabTone = pendingReqs.length === 0 ? 'slate' : pendingIncompleteCount > 0 ? 'rose' : 'emerald';
+    const pendingTabActiveClass = approvalTabTone === 'rose'
+      ? 'border border-rose-200 bg-rose-100 text-rose-700'
+      : approvalTabTone === 'emerald'
+        ? 'border border-emerald-200 bg-emerald-100 text-emerald-700'
+        : 'border border-slate-200 bg-slate-100 text-slate-600';
 
     return (
     <div className="space-y-4">
@@ -4128,43 +4400,63 @@ export default function App() {
         </button>
       </div>
 
-      {/* 탭 전환 */}
-      <div className="flex gap-2">
-        <button onClick={() => setApprovalViewTab('pending')} className={`px-4 py-2 rounded-lg font-bold text-sm transition ${approvalViewTab === 'pending' ? 'bg-orange-500 text-white' : 'bg-white border text-slate-600 hover:bg-slate-50'}`}>
-          대기 중 <span className="ml-1 bg-white text-orange-500 px-1.5 py-0.5 rounded-full text-xs font-bold">{pendingReqs.length}</span>
-        </button>
-        <button onClick={() => setApprovalViewTab('all')} className={`px-4 py-2 rounded-lg font-bold text-sm transition ${approvalViewTab === 'all' ? 'bg-slate-700 text-white' : 'bg-white border text-slate-600 hover:bg-slate-50'}`}>
-          전체 내역
-        </button>
+      <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+        <div className="flex gap-2 flex-wrap">
+          <button onClick={() => setApprovalViewTab('pending')} className={`px-4 py-2 rounded-lg font-bold text-sm transition ${approvalViewTab === 'pending' ? pendingTabActiveClass : 'bg-white border text-slate-600 hover:bg-slate-50'}`}>
+            대기 중 <span className={`ml-1 px-1.5 py-0.5 rounded-full text-xs font-bold ${approvalTabTone === 'rose' ? 'bg-white text-rose-600' : approvalTabTone === 'emerald' ? 'bg-white text-emerald-600' : 'bg-white text-slate-500'}`}>{pendingReqs.length}</span>
+          </button>
+          <button onClick={() => setApprovalViewTab('all')} className={`px-4 py-2 rounded-lg font-bold text-sm transition ${approvalViewTab === 'all' ? 'bg-slate-700 text-white' : 'bg-white border text-slate-600 hover:bg-slate-50'}`}>
+            전체 내역
+          </button>
+        </div>
+        <div className="flex gap-2 flex-wrap">
+          <button onClick={() => setApprovalQuickFilter('all')} className={`px-3 py-2 rounded-lg text-xs font-bold border transition ${approvalQuickFilter === 'all' ? 'bg-slate-800 text-white border-slate-800' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}>전체 보기</button>
+          <button onClick={() => setApprovalQuickFilter('needs_attention')} className={`px-3 py-2 rounded-lg text-xs font-bold border transition ${approvalQuickFilter === 'needs_attention' ? 'bg-rose-600 text-white border-rose-600' : 'bg-white text-rose-700 border-rose-200 hover:bg-rose-50'}`}>미지정 보완 필요</button>
+          <button onClick={() => setApprovalQuickFilter('complete')} className={`px-3 py-2 rounded-lg text-xs font-bold border transition ${approvalQuickFilter === 'complete' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white text-emerald-700 border-emerald-200 hover:bg-emerald-50'}`}>입력 완료만</button>
+        </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-        <div className="rounded-xl border border-orange-200 bg-orange-50 p-4">
-          <div className="text-xs font-bold text-orange-700">승인 대기</div>
-          <div className="mt-1 text-2xl font-bold text-orange-600">{pendingReqs.length}</div>
-          <div className="text-xs text-orange-500 mt-1">오늘 우선 확인이 필요한 건수</div>
+      {approvalViewTab === 'pending' && pendingReqs.length > 0 && (
+        <div className={`rounded-xl border px-4 py-3 text-sm ${pendingIncompleteCount > 0 ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-emerald-200 bg-emerald-50 text-emerald-700'}`}>
+          {pendingIncompleteCount > 0
+            ? `미지정 항목이 있는 신청 ${pendingIncompleteCount}건을 상단에 우선 배치했습니다.${pendingRequestCompletenessSummary.topMissingField ? ` 가장 많이 비어 있는 항목은 ${pendingRequestCompletenessSummary.topMissingField}입니다.` : ''}`
+            : '현재 승인 대기 신청은 모두 제조사·선반 등 핵심 항목이 입력된 상태입니다.'}
         </div>
+      )}
+
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+        <button type="button" onClick={() => { setApprovalViewTab('pending'); setApprovalQuickFilter('all'); }} className={`rounded-xl border p-4 text-left transition ${approvalTabTone === 'rose' ? 'border-rose-200 bg-rose-50 hover:bg-rose-100/80' : approvalTabTone === 'emerald' ? 'border-emerald-200 bg-emerald-50 hover:bg-emerald-100/80' : 'border-slate-200 bg-white hover:bg-slate-50'}`}>
+          <div className={`text-xs font-bold ${approvalTabTone === 'rose' ? 'text-rose-700' : approvalTabTone === 'emerald' ? 'text-emerald-700' : 'text-slate-500'}`}>승인 대기</div>
+          <div className={`mt-1 text-2xl font-bold ${approvalTabTone === 'rose' ? 'text-rose-600' : approvalTabTone === 'emerald' ? 'text-emerald-600' : 'text-slate-800'}`}>{pendingReqs.length}</div>
+          <div className={`text-xs mt-1 ${approvalTabTone === 'rose' ? 'text-rose-500' : approvalTabTone === 'emerald' ? 'text-emerald-600' : 'text-slate-400'}`}>{pendingIncompleteCount > 0 ? '미지정 항목이 있어 우선 보완 필요' : '핵심 입력값이 모두 채워진 상태'}</div>
+        </button>
+        <button type="button" onClick={() => { setApprovalViewTab('pending'); setApprovalQuickFilter('needs_attention'); }} className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-left hover:bg-rose-100/80 transition">
+          <div className="text-xs font-bold text-rose-700">보완 필요</div>
+          <div className="mt-1 text-2xl font-bold text-rose-600">{pendingIncompleteCount}</div>
+          <div className="text-xs text-rose-500 mt-1">제조사·선반 등 미지정 항목이 있는 신청</div>
+        </button>
+        <button type="button" onClick={() => { setApprovalViewTab('pending'); setApprovalQuickFilter('complete'); }} className="rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-left hover:bg-emerald-100/80 transition">
+          <div className="text-xs font-bold text-emerald-700">입력 완료</div>
+          <div className="mt-1 text-2xl font-bold text-emerald-600">{pendingCompleteCount}</div>
+          <div className="text-xs text-emerald-600 mt-1">바로 검토·승인하기 좋은 신청</div>
+        </button>
         <div className="rounded-xl border border-blue-200 bg-blue-50 p-4">
-          <div className="text-xs font-bold text-blue-700">승인 완료</div>
-          <div className="mt-1 text-2xl font-bold text-blue-600">{approvedCount}</div>
-          <div className="text-xs text-blue-500 mt-1">재고 반영까지 끝난 신청</div>
-        </div>
-        <div className="rounded-xl border border-rose-200 bg-rose-50 p-4">
-          <div className="text-xs font-bold text-rose-700">반려</div>
-          <div className="mt-1 text-2xl font-bold text-rose-600">{rejectedCount}</div>
-          <div className="text-xs text-rose-500 mt-1">검토 후 반려된 신청</div>
+          <div className="text-xs font-bold text-blue-700">완료 / 반려</div>
+          <div className="mt-1 text-2xl font-bold text-blue-600">{approvedCount + rejectedCount}</div>
+          <div className="text-xs text-blue-500 mt-1">승인 {approvedCount} · 반려 {rejectedCount}</div>
         </div>
       </div>
 
       <div className="md:hidden space-y-3">
         {displayReqs.length === 0 ? (
           <div className="bg-white rounded-xl border p-8 text-center text-slate-500">항목이 없습니다.</div>
-        ) : displayReqs.map(req => (
-          <div key={req.id} className={`bg-white rounded-xl border shadow-sm p-4 space-y-3 ${req.status === 'PENDING' ? 'border-blue-200' : req.status === 'APPROVED' ? 'border-green-200' : 'border-rose-200'}`}>
+        ) : displayReqs.map(({ req, completeness }) => (
+          <div key={req.id} className={`rounded-xl border shadow-sm p-4 space-y-3 ${completeness.cardClass}`}>
             <div className="flex items-start justify-between gap-3">
               <div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <span className={`px-2 py-1 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-600 text-white' : 'bg-red-600 text-white'}`}>{req.type === 'IN' ? '반입' : '반출'}</span>
+                  <span className={`px-2 py-1 rounded text-[11px] font-bold ${completeness.badgeClass}`}>{completeness.badgeLabel}</span>
                   {req.inventoryLocked && <span className="px-2 py-1 rounded text-[11px] font-bold bg-amber-100 text-amber-700">재고 유지 편집</span>}
                 </div>
                 <div className="mt-2 font-bold text-slate-800">{req.chemicalName}</div>
@@ -4179,20 +4471,22 @@ export default function App() {
                 </div>
               </div>
             </div>
+            <div className={`rounded-lg border px-3 py-2 text-[11px] font-semibold ${completeness.badgeClass} ${completeness.helperClass}`}>
+              {completeness.helperText}
+            </div>
             <div className="grid grid-cols-2 gap-2 text-sm">
-              <div className="rounded-lg bg-slate-50 p-2"><div className="text-[11px] text-slate-400">수량</div><div className="font-bold text-blue-700">{formatBottleDisplay(req.amount, req.unit, req.bottleSize, req.bottleUnit, req.bottleCount, true)}</div></div>
-              <div className="rounded-lg bg-slate-50 p-2"><div className="text-[11px] text-slate-400">내선</div><div className="text-slate-700">{req.ext || '-'}</div></div>
-              <div className="rounded-lg bg-slate-50 p-2 col-span-2"><div className="text-[11px] text-slate-400">제조사 / 선반</div><div className="text-slate-700">{req.manufacturer || '-'} · {getRequestShelfDisplay(req)}</div></div>
+              <div className="rounded-lg bg-white/70 p-2"><div className="text-[11px] text-slate-400">수량</div><div className="font-bold text-blue-700">{formatBottleDisplay(req.amount, req.unit, req.bottleSize, req.bottleUnit, req.bottleCount, true)}</div></div>
+              <div className="rounded-lg bg-white/70 p-2"><div className="text-[11px] text-slate-400">내선</div><div className="text-slate-700">{req.ext || '-'}</div></div>
+              <div className="rounded-lg bg-white/70 p-2 col-span-2"><div className="text-[11px] text-slate-400">제조사 / 선반</div><div className="text-slate-700">{req.manufacturer || '-'} · {getRequestShelfDisplay(req)}</div></div>
             </div>
             <div className="flex flex-wrap gap-2">
               {req.status === 'PENDING' && <>
-                <button onClick={() => setEditingRequest(toEditableRequest(req))} className="flex-1 min-w-[90px] px-3 py-2 rounded-lg bg-blue-100 text-blue-700 font-bold text-sm">수정</button>
-                <button onClick={() => approveRequest(req)} className="flex-1 min-w-[90px] px-3 py-2 rounded-lg bg-green-600 text-white font-bold text-sm">{req.inventoryLocked ? '승인(재고 유지)' : '승인'}</button>
-                <button onClick={() => rejectRequest(req.id)} className="flex-1 min-w-[90px] px-3 py-2 rounded-lg bg-red-500 text-white font-bold text-sm">거절</button>
+                <button disabled={processingRequestIds.has(String(req.id))} onClick={() => setEditingRequest(toEditableRequest(req))} className="flex-1 min-w-[90px] px-3 py-2 rounded-lg bg-blue-100 text-blue-700 font-bold text-sm disabled:opacity-50 disabled:cursor-not-allowed">수정</button>
+                <button disabled={processingRequestIds.has(String(req.id))} onClick={() => approveRequest(req)} className="flex-1 min-w-[90px] px-3 py-2 rounded-lg bg-green-600 text-white font-bold text-sm disabled:opacity-60 disabled:cursor-not-allowed">{processingRequestIds.has(String(req.id)) ? '처리 중...' : (req.inventoryLocked ? '승인(재고 유지)' : '승인')}</button>
+                <button disabled={processingRequestIds.has(String(req.id))} onClick={() => rejectRequest(req.id)} className="flex-1 min-w-[90px] px-3 py-2 rounded-lg bg-red-500 text-white font-bold text-sm disabled:opacity-50 disabled:cursor-not-allowed">거절</button>
               </>}
               {req.status !== 'PENDING' && (
-                <div className="flex gap-2">
-                  {/* ✅ 승인 대기 이동과 완전 삭제를 별도 버튼으로 분리 */}
+                <div className="flex gap-2 w-full">
                   <button onClick={() => recycleRequestToPending(req)} className="flex-1 px-3 py-2 rounded-lg bg-amber-50 text-amber-700 border border-amber-200 font-bold text-sm">↺ 대기로 이동</button>
                   <button onClick={() => handleDeleteRequest(req)} className="flex-1 px-3 py-2 rounded-lg bg-red-50 text-red-600 border border-red-200 font-bold text-sm">🗑 완전 삭제</button>
                 </div>
@@ -4208,7 +4502,7 @@ export default function App() {
             <tr>
               <th className="p-2 md:p-3">구분</th>
               <th className="p-2 md:p-3">반출입일</th>
-                            <th className="p-2 md:p-3">저장소/실험실</th>
+              <th className="p-2 md:p-3">저장소/실험실</th>
               <th className="p-2 md:p-3">내선</th>
               <th className="p-2 md:p-3">물질/수량</th>
               <th className="p-2 md:p-3">상태</th>
@@ -4219,31 +4513,40 @@ export default function App() {
             {displayReqs.length === 0 ? (
                 <tr><td colSpan="7" className="p-8 text-center text-slate-500">항목이 없습니다.</td></tr>
             ) : (
-                displayReqs.map(req => (
-                <tr key={req.id} className={req.status === 'PENDING' ? 'bg-blue-50/30' : req.status === 'APPROVED' ? 'bg-green-50/20' : 'bg-red-50/10'}>
+                displayReqs.map(({ req, completeness }) => (
+                <tr key={req.id} className={completeness.rowClass}>
                     <td className="p-2 md:p-3"><span className={`px-1.5 py-0.5 rounded text-xs font-bold ${req.type === 'IN' ? 'bg-green-600 text-white' : 'bg-red-600 text-white'}`}>{req.type === 'IN' ? '반입' : '반출'}</span></td>
                     <td className="p-2 md:p-3 text-xs font-bold text-slate-700">{req.actionDate || req.date || '-'}</td>
-                                        <td className="p-2 md:p-3"><div className="font-bold text-xs">{req.storage}</div><div className="text-xs text-slate-500">{req.labName}</div></td>
+                    <td className="p-2 md:p-3"><div className="font-bold text-xs">{req.storage}</div><div className="text-xs text-slate-500">{req.labName}</div></td>
                     <td className="p-2 md:p-3 text-xs text-slate-600 font-medium">{req.ext || '-'}</td>
-                    <td className="p-2 md:p-3"><div className="font-bold text-xs">{req.chemicalName}</div><div className="text-xs text-blue-600">{formatBottleDisplay(req.amount, req.unit, req.bottleSize, req.bottleUnit, req.bottleCount, true)}</div><div className="text-xs text-slate-400">{req.manufacturer}</div>{req.inventoryLocked && <div className="mt-1 text-[11px] text-amber-700 font-bold">재고 유지 편집 모드</div>}</td>
+                    <td className="p-2 md:p-3">
+                      <div className="font-bold text-xs">{req.chemicalName}</div>
+                      <div className="text-xs text-blue-600">{formatBottleDisplay(req.amount, req.unit, req.bottleSize, req.bottleUnit, req.bottleCount, true)}</div>
+                      <div className="text-xs text-slate-500">{req.manufacturer || '-'} · {getRequestShelfDisplay(req)}</div>
+                      <div className={`mt-1 text-[11px] font-bold ${completeness.helperClass}`}>{completeness.helperText}</div>
+                      {req.inventoryLocked && <div className="mt-1 text-[11px] text-amber-700 font-bold">재고 유지 편집 모드</div>}
+                    </td>
 
                     <td className="p-2 md:p-3">
-                      {req.status === 'PENDING' && <span className="px-1.5 py-0.5 bg-yellow-100 text-yellow-700 rounded text-xs font-bold">대기중</span>}
-                      {req.status === 'APPROVED' && <span className="px-1.5 py-0.5 bg-blue-100 text-blue-700 rounded text-xs font-bold">승인됨</span>}
-                      {req.status === 'REJECTED' && <span className="px-1.5 py-0.5 bg-red-100 text-red-700 rounded text-xs font-bold">반려됨</span>}
+                      <div className="flex flex-col gap-1">
+                        <div>
+                          {req.status === 'PENDING' && <span className="px-1.5 py-0.5 bg-yellow-100 text-yellow-700 rounded text-xs font-bold">대기중</span>}
+                          {req.status === 'APPROVED' && <span className="px-1.5 py-0.5 bg-blue-100 text-blue-700 rounded text-xs font-bold">승인됨</span>}
+                          {req.status === 'REJECTED' && <span className="px-1.5 py-0.5 bg-red-100 text-red-700 rounded text-xs font-bold">반려됨</span>}
+                        </div>
+                        <span className={`inline-flex w-fit px-1.5 py-0.5 rounded text-[11px] font-bold ${completeness.badgeClass}`}>{completeness.badgeLabel}</span>
+                      </div>
                     </td>
                     <td className="p-2 md:p-3 text-center">
                         <div className="flex justify-center gap-1">
                         {req.status === 'PENDING' && <>
-                          <button onClick={() => setEditingRequest(toEditableRequest(req))} className="p-1.5 bg-blue-100 text-blue-700 rounded hover:bg-blue-200 transition" title="내용 수정"><Edit2 size={15}/></button>
-                          <button onClick={() => approveRequest(req)} className="p-1.5 bg-green-500 text-white rounded hover:bg-green-600 transition" title={req.inventoryLocked ? '승인(재고 유지)' : '승인'}><CheckCircle size={15}/></button>
-                          <button onClick={() => rejectRequest(req.id)} className="p-1.5 bg-red-500 text-white rounded hover:bg-red-600 transition" title="거절"><XCircle size={15}/></button>
-                          {/* ✅ 대기 상태도 삭제 가능하도록 추가 */}
-                          <button onClick={() => handleDeleteRequest(req)} className="p-1.5 bg-slate-100 text-slate-500 rounded hover:bg-red-100 hover:text-red-600 transition" title="삭제"><Trash2 size={15}/></button>
+                          <button disabled={processingRequestIds.has(String(req.id))} onClick={() => setEditingRequest(toEditableRequest(req))} className="p-1.5 bg-blue-100 text-blue-700 rounded hover:bg-blue-200 transition disabled:opacity-50 disabled:cursor-not-allowed" title="내용 수정"><Edit2 size={15}/></button>
+                          <button disabled={processingRequestIds.has(String(req.id))} onClick={() => approveRequest(req)} className="p-1.5 bg-green-500 text-white rounded hover:bg-green-600 transition disabled:opacity-60 disabled:cursor-not-allowed" title={processingRequestIds.has(String(req.id)) ? '처리 중...' : (req.inventoryLocked ? '승인(재고 유지)' : '승인')}>{processingRequestIds.has(String(req.id)) ? <RotateCcw size={15} className="animate-spin"/> : <CheckCircle size={15}/>}</button>
+                          <button disabled={processingRequestIds.has(String(req.id))} onClick={() => rejectRequest(req.id)} className="p-1.5 bg-red-500 text-white rounded hover:bg-red-600 transition disabled:opacity-50 disabled:cursor-not-allowed" title="거절"><XCircle size={15}/></button>
+                          <button disabled={processingRequestIds.has(String(req.id))} onClick={() => handleDeleteRequest(req)} className="p-1.5 bg-slate-100 text-slate-500 rounded hover:bg-red-100 hover:text-red-600 transition disabled:opacity-50 disabled:cursor-not-allowed" title="삭제"><Trash2 size={15}/></button>
                         </>}
-              {req.status !== 'PENDING' && (
+                        {req.status !== 'PENDING' && (
                           <>
-                            {/* ✅ "승인 대기로 이동" 과 "완전 삭제"를 분리하여 명확하게 구분 */}
                             <button onClick={() => recycleRequestToPending(req)} className="p-1.5 bg-amber-50 text-amber-700 rounded hover:bg-amber-100 transition border border-amber-200" title="승인 대기로 이동(재고 유지)"><RotateCcw size={15}/></button>
                             <button onClick={() => handleDeleteRequest(req)} className="p-1.5 bg-red-50 text-red-500 rounded hover:bg-red-100 transition border border-red-200" title="완전 삭제(재고 롤백)"><Trash2 size={15}/></button>
                           </>
@@ -4257,12 +4560,17 @@ export default function App() {
         </table>
       </div>
 
-      {/* 승인 편집 모달 */}
       {editingRequest && (
         <div className="fixed inset-0 bg-black/60 z-[100] flex items-center justify-center p-3 md:p-4">
           <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full max-h-[92vh] flex flex-col overflow-hidden">
             <div className="px-5 pt-5 md:px-6 md:pt-6">
               <h3 className="text-xl font-bold mb-4 text-slate-800 flex items-center gap-2"><Edit2 size={20} className="text-blue-600"/> 신청 내역 수정</h3>
+              {editingRequestCompleteness && (
+                <div className={`mb-4 rounded-xl border px-3 py-2 text-xs ${editingRequestCompleteness.badgeClass} ${editingRequestCompleteness.helperClass}`}>
+                  <div className="font-bold">{editingRequestCompleteness.isComplete ? '입력 완료 상태입니다. 저장 후 바로 승인해도 됩니다.' : '미지정 항목이 있어 확인이 필요합니다.'}</div>
+                  <div className="mt-1">{editingRequestCompleteness.isComplete ? editingRequestCompleteness.helperText : `미기입 항목: ${editingRequestCompleteness.missingFields.join(', ')}`}</div>
+                </div>
+              )}
             </div>
             <div className="flex-1 overflow-y-auto px-5 md:px-6 pb-4 space-y-3">
               <div className="grid grid-cols-2 gap-3">
@@ -4435,9 +4743,12 @@ export default function App() {
                 </div>
               )}
             </div>
-            <div className="sticky bottom-0 bg-white border-t px-5 py-4 md:px-6 flex gap-3 justify-end pb-[calc(env(safe-area-inset-bottom)+1rem)]">
-              <button onClick={() => { setIsEditChemDropdownOpen(false); setEditingRequest(null); }} className="px-4 py-2 bg-slate-200 rounded-lg font-medium hover:bg-slate-300">취소</button>
-              <button onClick={() => { setIsEditChemDropdownOpen(false); saveEditedRequest(editingRequest); }} className="px-5 py-2 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700">저장</button>
+            <div className="sticky bottom-0 bg-white border-t px-5 py-4 md:px-6 flex flex-col sm:flex-row gap-3 justify-end pb-[calc(env(safe-area-inset-bottom)+1rem)]">
+              <button onClick={() => { setIsEditChemDropdownOpen(false); setEditingRequest(null); }} className="w-full sm:w-auto px-4 py-2 bg-slate-200 rounded-lg font-medium hover:bg-slate-300">취소</button>
+              <button disabled={processingRequestIds.has(String(editingRequest.id))} onClick={() => { setIsEditChemDropdownOpen(false); saveEditedRequest(editingRequest); }} className="w-full sm:w-auto px-5 py-2 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed">저장</button>
+              {editingRequest.status === 'PENDING' && (
+                <button disabled={processingRequestIds.has(String(editingRequest.id))} onClick={() => { setIsEditChemDropdownOpen(false); saveEditedRequest(editingRequest, { approveAfterSave: true }); }} className="w-full sm:w-auto px-5 py-2 bg-emerald-600 text-white rounded-lg font-bold hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed">{processingRequestIds.has(String(editingRequest.id)) ? '처리 중...' : '저장 후 승인'}</button>
+              )}
             </div>
           </div>
         </div>
